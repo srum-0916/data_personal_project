@@ -12,6 +12,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split, StratifiedKFold, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
@@ -69,9 +70,15 @@ def make_model(name, extras=()):
     if cat:
         transforms.append(('유형', OneHotEncoder(categories=[TYPES], drop='first', handle_unknown='ignore', sparse_output=False), cat))
     prep = ColumnTransformer(transforms, remainder='drop')
-    estimator = (RandomForestRegressor(n_estimators=150, max_depth=8, min_samples_leaf=5,
-                                       random_state=SEED, n_jobs=1)
-                 if name == '랜덤 포레스트 · 크기+유형' else LinearRegression())
+    if name == '랜덤 포레스트 · 크기+유형':
+        estimator = RandomForestRegressor(n_estimators=150, max_depth=8, min_samples_leaf=5,
+                                          random_state=SEED, n_jobs=1)
+    elif name == '의사결정나무 · 크기+유형':
+        estimator = DecisionTreeRegressor(max_depth=4, min_samples_leaf=5, random_state=SEED)
+    elif name in ['선형 회귀 · 크기만', '선형 회귀 · 크기+유형']:
+        estimator = LinearRegression()
+    else:
+        raise ValueError('알 수 없는 모델: ' + name)
     return Pipeline([('변환', prep), ('예측', estimator)])
 
 
@@ -86,7 +93,7 @@ def fit_experiment(data):
                                           random_state=SEED, stratify=data[TYPE])
     train, test = data.iloc[train_idx], data.iloc[test_idx]
     cv = list(StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED).split(train, train[TYPE]))
-    names = ['평균 기준선', '선형 회귀 · 크기만', '선형 회귀 · 크기+유형', '랜덤 포레스트 · 크기+유형']
+    names = ['평균 기준선', '선형 회귀 · 크기만', '선형 회귀 · 크기+유형', '의사결정나무 · 크기+유형', '랜덤 포레스트 · 크기+유형']
     rows, fitted, predictions = [], {}, {}
     for name in names:
         template = make_model(name)
@@ -102,7 +109,7 @@ def fit_experiment(data):
                      '교차검증 MAE 표준편차': np.std(fold_mae), '테스트 MAE': mae, '테스트 R²': r2})
         fitted[name], predictions[name] = model, pred
     scores = pd.DataFrame(rows).set_index('모델')
-    selected = scores.drop(index='평균 기준선')['교차검증 MAE'].idxmin()
+    selected = scores.drop(index=['평균 기준선', '선형 회귀 · 크기만'])['교차검증 MAE'].idxmin()
     result = test[['모델명', TYPE, SIZE, TARGET]].copy()
     result['예측 점수'] = predictions[selected]
     result['잔차 (실제−예측)'] = result[TARGET] - result['예측 점수']
@@ -246,12 +253,18 @@ def results_page(data, result):
     if experiment != '기본 실험':
         extra_results_page(data, result)
         return
-    st.write('학습 데이터 내부에서 유형 비율을 보존한 3겹 교차검증을 수행했습니다. 평균 기준선을 제외한 후보 중 교차검증 MAE가 가장 낮은 모델을 선택하고, 동일한 별도 테스트 데이터에서 평가합니다.')
+    st.write('학습 데이터 내부에서 유형 비율을 보존한 3겹 교차검증을 수행했습니다. 크기와 유형을 동일하게 입력한 세 알고리즘 중 교차검증 MAE가 가장 낮은 모델을 선택하고, 동일한 별도 테스트 데이터에서 평가합니다.')
+    st.dataframe(pd.DataFrame([
+        ['선형 회귀', '입력과 점수의 관계를 하나의 식으로 학습'],
+        ['의사결정나무 회귀', '조건으로 구간을 나누고 구간 내 학습 점수의 평균으로 예측'],
+        ['랜덤 포레스트 회귀', '여러 결정나무의 예측을 평균'],
+    ], columns=['실제 모델 종류', '작동 방식']), hide_index=True, width='stretch')
+    st.caption('세 알고리즘의 입력은 크기+유형으로 같습니다. 크기만 사용하는 선형 회귀는 입력 효과를 확인하는 보조 실험이며 별도 모델 종류로 세지 않습니다.')
     st.success('교차검증으로 선택한 모델: ' + result['selected'])
     st.dataframe(result['scores'].round(4), width='stretch')
     st.caption('교차검증 표준편차는 3개 검증 폴드의 MAE 차이이며 신뢰구간이 아닙니다. 각 폴드 안에서 전처리 변환과 모델을 다시 학습합니다. 테스트 결과로 후보를 선택하지 않습니다.')
     with st.expander('모델 설정과 실제 분석 순서'):
-        st.write('선형 회귀는 절편 포함 최소제곱법입니다. 유형은 사전학습을 기준으로 원핫 인코딩하며 크기는 B 단위 원값을 사용합니다. 랜덤 포레스트는 150그루, 최대 깊이 8, 잎 최소 표본 5, 시드 42로 고정하고 추가 튜닝하지 않습니다.')
+        st.write('선형 회귀는 절편 포함 최소제곱법입니다. 유형은 사전학습을 기준으로 원핫 인코딩하며 크기는 B 단위 원값을 사용합니다. 의사결정나무는 최대 깊이 4, 잎 최소 표본 5, 시드 42입니다. 랜덤 포레스트는 150그루, 최대 깊이 8, 잎 최소 표본 5, 시드 42로 고정하고 추가 튜닝하지 않습니다.')
         st.write('CSV 읽기 → 핵심 열 유효성 점검 → 8:2 분할 → 학습 데이터 안 3겹 검증 → 후보 선택 → 전체 학습분으로 재학습 → 테스트 평가 → 오차 해석 순서입니다. 예측값을 0~100으로 잘라 성능을 개선하지 않습니다.')
     bars = result['scores'][['학습 MAE', '교차검증 MAE', '테스트 MAE']].reset_index().melt(id_vars='모델', var_name='평가 구분', value_name='MAE (점)')
     chart(px.bar(bars, x='모델', y='MAE (점)', color='평가 구분', barmode='group'))
@@ -342,6 +355,7 @@ def fit_extra(data):
                       ('추론+수학 추가', required)]
     rows, predictions = [], {}
     for family, name in [('선형 회귀', '선형 회귀 · 크기+유형'),
+                         ('의사결정나무', '의사결정나무 · 크기+유형'),
                          ('랜덤 포레스트', '랜덤 포레스트 · 크기+유형')]:
         for label, extras in configurations:
             template = make_model(name, extras)
@@ -365,7 +379,7 @@ def fit_extra(data):
 
 def extra_results_page(data, basic):
     st.subheader('추가 실험: 추론·수학 점수가 예측을 보완할까?')
-    st.caption('모든 조합에 크기와 유형이 포함됩니다. 기본 실험과 같은 8:2 분할·시드 42, 같은 3겹 교차검증과 모델 설정을 사용합니다.')
+    st.caption('각 입력 조합에서 선형 회귀·의사결정나무·랜덤 포레스트 세 종류를 비교합니다. 모든 조합에 크기와 유형이 포함됩니다. 기본 실험과 같은 8:2 분할·시드 42, 같은 3겹 교차검증과 모델 설정을 사용합니다.')
     st.caption('추론은 BBH 환산 점수, 수학은 MATH Level 5 점수입니다. 실제 활용 시 이 두 평가 점수를 미리 알아야 합니다.')
     try:
         result = fit_extra(data)
