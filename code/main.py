@@ -1,252 +1,382 @@
-"""실행: streamlit run main.py"""
+"""실행: streamlit run code/main.py. 데이터는 ../data 또는 공개 GitHub CSV에서 읽습니다."""
 import io
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, GroupShuffleSplit
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
 
-DATA_URL = 'https://raw.githubusercontent.com/srum-0916/data_personal_project/refs/heads/main/data/open_llm_leaderboard.csv'
+BASE_URL = 'https://raw.githubusercontent.com/srum-0916/data_personal_project/main/data/'
+SIZE, TYPE, TARGET = '모델 크기(B)', '모델 유형', '지시 수행 점수'
+TYPES = ['사전학습', '대화용', '분야별 추가 학습', '모델 병합']
+COLORS = dict(zip(TYPES, ['#64748B', '#2563EB', '#D97706', '#059669']))
+LABELS = {'🟢 pretrained': '사전학습', '💬 chat models (RLHF, DPO, IFT, ...)': '대화용',
+          '🔶 fine-tuned on domain-specific datasets': '분야별 추가 학습',
+          '🤝 base merges and moerges': '모델 병합'}
+RENAMES = {'fullname': '모델명', 'Type': TYPE, '#Params (B)': SIZE, 'IFEval': TARGET,
+           'BBH': '추론 점수', 'MATH Lvl 5': '수학 점수', 'Architecture': '모델 구조',
+           'Precision': '수치 정밀도', 'Chat Template': '대화 형식 사용'}
+SEED = 42
+CAP = 30.809
 
 
 @st.cache_data(ttl=3600)
-def load_data(filename='open_llm_leaderboard.csv'):
-    # code 폴더와 저장소 최상위 어디에 두어도 data 폴더를 찾습니다.
-    root = Path(__file__).resolve().parent
-    for candidate in [root / 'data' / filename, root.parent / 'data' / filename]:
-        if candidate.is_file():
-            return pd.read_csv(candidate, encoding='utf-8-sig').replace(r'^\s*$', np.nan, regex=True)
-    url = DATA_URL.rsplit('/', 1)[0] + '/' + filename
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    # 공백만 있는 칸도 결측값으로 취급합니다. 0과 False는 유지합니다.
-    return pd.read_csv(io.BytesIO(response.content), encoding='utf-8-sig').replace(r'^\s*$', np.nan, regex=True)
+def load_data(filename):
+    folder = Path(__file__).resolve().parent
+    for p in [folder.parent / 'data' / filename, folder / 'data' / filename]:
+        if p.is_file():
+            return pd.read_csv(p, encoding='utf-8-sig').replace(r'^\s*$', np.nan, regex=True)
+    r = requests.get(BASE_URL + filename, timeout=30)
+    r.raise_for_status()
+    return pd.read_csv(io.BytesIO(r.content), encoding='utf-8-sig').replace(r'^\s*$', np.nan, regex=True)
 
 
-def render_original():
-    st.title('공개 언어 모델 데이터 기초통계')
-    st.write('Open LLM Leaderboard 원본 데이터의 구성, 결측치, 수치 분포를 살펴봅니다.')
-    st.markdown(f'[원본 CSV 보기]({DATA_URL})')
-    try:
-        data = load_data()
-    except Exception as exc:
-        st.error(f'데이터를 불러오지 못했습니다. 인터넷 연결과 CSV 주소를 확인하세요. {exc}')
-        st.stop()
-    numeric = data.select_dtypes(include='number').columns.tolist()
-    total_missing = int(data.isna().sum().sum())
-    cells = data.size
-    cards = st.columns(4)
-    cards[0].metric('행 수 (평가 기록)', f'{len(data):,}')
-    cards[1].metric('열 수', f'{len(data.columns):,}')
-    cards[2].metric('수치형 열 수', f'{len(numeric):,}')
-    cards[3].metric('결측 셀 수', f'{total_missing:,}')
-    st.caption(f'전체 셀 중 결측 비율: {total_missing/cells*100 if cells else 0:.2f}% · 완전히 동일한 중복 행: {int(data.duplicated().sum()):,}개')
-    st.caption('각 행은 평가 기록입니다. 같은 모델이 여러 번 평가되었을 수 있습니다. 통계 계산에서 결측값은 제외하고, 점수 0은 포함합니다.')
+def checked_data(raw):
+    required = ['모델명', SIZE, TYPE, TARGET]
+    absent = [c for c in required if c not in raw]
+    if absent:
+        raise ValueError('필수 열 없음: ' + ', '.join(absent))
+    d = raw.copy()
+    for col in [SIZE, TARGET]:
+        d[col] = pd.to_numeric(d[col], errors='coerce')
+    valid = d[TYPE].isin(TYPES) & d['모델명'].notna() & np.isfinite(d[SIZE]) & d[SIZE].gt(0)
+    valid &= np.isfinite(d[TARGET]) & d[TARGET].between(0, 100)
+    if not valid.all():
+        raise ValueError(f'유형·크기·점수·모델명에 유효하지 않은 {int((~valid).sum())}행이 있습니다. CSV 전처리를 확인하세요.')
+    if d['모델명'].duplicated().any():
+        raise ValueError('모델명이 중복됩니다. 동일 모델이 학습과 평가에 섞이지 않도록 전처리를 확인하세요.')
+    if len(d) < 50 or d[TYPE].value_counts().min() < 10:
+        raise ValueError('모델 평가를 위한 기록 또는 유형별 기록이 부족합니다.')
+    return d.reset_index(drop=True)
 
-    overview, stats, missing, distribution = st.tabs(['데이터 구성', '기초통계', '결측치', '분포 탐색'])
-    with overview:
-        st.subheader('열별 정보')
-        info = pd.DataFrame({'열 이름': data.columns, '자료형': data.dtypes.astype(str).values,
-                             '값이 있는 행 수': data.notna().sum().values,
-                             '결측 행 수': data.isna().sum().values,
-                             '서로 다른 값 수 (결측 제외)': data.nunique().values})
-        st.dataframe(info, hide_index=True, width='stretch')
-        st.subheader('원본 데이터 미리보기')
-        count = st.selectbox('표시할 행 수', [10, 30, 100], index=0)
-        st.dataframe(data.head(count), hide_index=True, width='stretch')
-        st.caption('화면 표에는 HTML이 포함된 값도 원문 텍스트로 표시됩니다.')
-    with stats:
-        st.subheader('수치형 열의 기초통계')
-        st.caption('표준편차는 표본 표준편차(ddof=1)입니다. 평가 점수·모델 크기 등은 단위가 서로 다르므로 열별로 해석하세요.')
-        if numeric:
-            summary = data[numeric].describe().T.rename(columns={
-                'count': '유효 개수', 'mean': '평균', 'std': '표준편차', 'min': '최솟값',
-                '25%': '1사분위수', '50%': '중앙값', '75%': '3사분위수', 'max': '최댓값'})
+
+def make_model(name):
+    if name == '평균 기준선':
+        return DummyRegressor(strategy='mean')
+    cat = [] if name == '선형 회귀 · 크기만' else [TYPE]
+    transforms = [('크기', 'passthrough', [SIZE])]
+    if cat:
+        transforms.append(('유형', OneHotEncoder(categories=[TYPES], drop='first', handle_unknown='ignore', sparse_output=False), cat))
+    prep = ColumnTransformer(transforms, remainder='drop')
+    estimator = (RandomForestRegressor(n_estimators=150, max_depth=8, min_samples_leaf=5,
+                                       random_state=SEED, n_jobs=1)
+                 if name == '랜덤 포레스트 · 크기+유형' else LinearRegression())
+    return Pipeline([('변환', prep), ('예측', estimator)])
+
+
+def metrics(y, pred):
+    return mean_absolute_error(y, pred), r2_score(y, pred)
+
+
+@st.cache_resource(show_spinner='회귀 모델을 학습하고 검증하는 중입니다…')
+def fit_experiment(data):
+    # 테스트는 후보 선택에 사용하지 않습니다. 유형별 비율을 보존합니다.
+    train_idx, test_idx = train_test_split(np.arange(len(data)), test_size=.2,
+                                          random_state=SEED, stratify=data[TYPE])
+    train, test = data.iloc[train_idx], data.iloc[test_idx]
+    cv = list(StratifiedKFold(n_splits=3, shuffle=True, random_state=SEED).split(train, train[TYPE]))
+    names = ['평균 기준선', '선형 회귀 · 크기만', '선형 회귀 · 크기+유형', '랜덤 포레스트 · 크기+유형']
+    rows, fitted, predictions = [], {}, {}
+    for name in names:
+        template = make_model(name)
+        fold_mae = []
+        for a, b in cv:
+            model = clone(template).fit(train.iloc[a][[SIZE, TYPE]], train.iloc[a][TARGET])
+            fold_mae.append(mean_absolute_error(train.iloc[b][TARGET], model.predict(train.iloc[b][[SIZE, TYPE]])))
+        model = template.fit(train[[SIZE, TYPE]], train[TARGET])
+        pred = model.predict(test[[SIZE, TYPE]])
+        train_mae, _ = metrics(train[TARGET], model.predict(train[[SIZE, TYPE]]))
+        mae, r2 = metrics(test[TARGET], pred)
+        rows.append({'모델': name, '학습 MAE': train_mae, '교차검증 MAE': np.mean(fold_mae),
+                     '교차검증 MAE 표준편차': np.std(fold_mae), '테스트 MAE': mae, '테스트 R²': r2})
+        fitted[name], predictions[name] = model, pred
+    scores = pd.DataFrame(rows).set_index('모델')
+    selected = scores.drop(index='평균 기준선')['교차검증 MAE'].idxmin()
+    result = test[['모델명', TYPE, SIZE, TARGET]].copy()
+    result['예측 점수'] = predictions[selected]
+    result['잔차 (실제−예측)'] = result[TARGET] - result['예측 점수']
+    result['절대 오차'] = result['잔차 (실제−예측)'].abs()
+    return {'scores': scores, 'models': fitted, 'predictions': predictions, 'selected': selected,
+            'train_idx': train_idx, 'test_idx': test_idx, 'test': result,
+            'training_mean': train[TARGET].mean()}
+
+
+def chart(fig):
+    fig.update_layout(font=dict(family='sans-serif'), margin=dict(t=45, b=35), legend_title_text='')
+    st.plotly_chart(fig, width='stretch')
+
+
+def question_page(data):
+    st.title('① 질문')
+    st.header('AI의 지시 수행 점수는 정말 모델 크기와 모델 유형만으로 예측할 수 있는가?')
+    st.write('대형 모델이 늘 좋은 점수를 얻는지, 모델의 제작·추가 학습 유형을 알면 예측이 얼마나 나아지는지 살펴봅니다. 평균만 사용하는 예측과 회귀 모델을 비교하여 두 정보가 설명하는 부분과 남는 오차를 확인합니다.')
+    st.info(f'분석 범위: 공개 언어 모델 네 유형 · 크기 0 초과 {CAP}B 이하 · 현재 {len(data):,}개. B는 10억 개 매개변수입니다.')
+    st.subheader('무엇을 입력하고 무엇을 예측하나?')
+    st.dataframe(pd.DataFrame([
+        ['입력', SIZE, '수치형', '모델의 매개변수 수를 10억 단위로 표현'],
+        ['입력', TYPE, '범주형', '사전학습·대화용·분야별 추가 학습·모델 병합'],
+        ['예측 대상', TARGET, '수치형', 'IFEval 엄격 준수율 두 지표의 평균 × 100'],
+    ], columns=['역할', '속성', '자료형', '뜻']), hide_index=True, width='stretch')
+    st.write('모델 유형에는 학습 방법과 병합 방법이 함께 포함되어 있어, 이를 하나의 학습량이나 학습 순서로 해석하지 않습니다. 추론·수학 점수, 모델명, 구조, 정밀도, 대화 형식은 이번 예측 입력에 넣지 않습니다.')
+    st.subheader('IFEval 점수의 정확한 의미')
+    st.write('정해진 문장 수, 지정 단어 포함, JSON 형식 등 프로그램으로 확인 가능한 조건을 지켰는지 채점합니다. 개별 조건의 엄격 준수율과 프롬프트의 모든 조건을 지킨 엄격 준수율을 평균합니다.')
+    st.latex(r'\mathrm{IFEval}=100\times\frac{\mathrm{instruction\ strict\ accuracy}+\mathrm{prompt\ strict\ accuracy}}{2}')
+    st.caption('예: 두 준수율이 0.8과 0.6이면 70점입니다. 70점이 곧 질문 70%를 완벽히 수행했다는 뜻은 아닙니다. 사실 정확성·창의성·전체 대화 능력의 종합 점수가 아닙니다.')
+    st.markdown('[공식 평가 설명](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about) · [IFEval 계산에 관한 운영진 답변](https://huggingface.co/spaces/open-llm-leaderboard/open_llm_leaderboard/discussions/911)')
+    st.subheader('검증할 내용')
+    st.write('1. 크기만 사용하는 회귀가 평균 기준선보다 나은가?\n\n2. 모델 유형을 추가하면 검증 오차가 줄어드는가?\n\n3. 복잡한 모델이 더 잘 예측하는가, 어떤 유형과 모델에서 크게 틀리는가?')
+
+
+def basic_stats(d, key):
+    c = st.columns(4)
+    for container, label, value in zip(c, ['행 수', '열 수', '수치형 열', '결측 셀'],
+                                       [len(d), len(d.columns), len(d.select_dtypes('number').columns), d.isna().sum().sum()]):
+        container.metric(label, f'{int(value):,}')
+    st.caption(f'완전히 동일한 중복 행: {d.duplicated().sum():,}개 · 빈 문자열·공백과 pandas 기본 결측 표기를 결측으로 인식합니다. 점수 0은 유지합니다.')
+    t1, t2, t3, t4 = st.tabs(['미리보기·열 정보', '기초통계', '결측치', '분포'])
+    with t1:
+        st.dataframe(d.head(50), hide_index=True, width='stretch')
+        st.dataframe(pd.DataFrame({'자료형': d.dtypes.astype(str), '유효 개수': d.notna().sum(),
+                                   '결측 개수': d.isna().sum(), '고유값 수': d.nunique()}), width='stretch')
+    with t2:
+        nums = d.select_dtypes('number')
+        if len(nums.columns):
+            summary = nums.describe().T.rename(columns={'count': '유효 개수', 'mean': '평균', 'std': '표준편차', 'min': '최솟값', '25%': '1사분위수', '50%': '중앙값', '75%': '3사분위수', 'max': '최댓값'})
             st.dataframe(summary.round(3), width='stretch')
-            st.download_button('기초통계표 CSV 다운로드', summary.to_csv(encoding='utf-8-sig').encode('utf-8-sig'),
-                               file_name='basic_statistics.csv', mime='text/csv')
-        else:
-            st.info('수치형 열이 없습니다.')
-        st.caption('참고: 모델 크기의 음수 등 의심스러운 값도 원본 통계에는 그대로 포함됩니다. 결측 처리나 이상값 제외는 별도 전처리 단계에서 결정해야 합니다.')
-    with missing:
-        st.subheader('열별 결측치')
-        table = pd.DataFrame({'열 이름': data.columns, '결측 개수': data.isna().sum().values})
-        table['결측 비율 (%)'] = table['결측 개수'] / len(data) * 100 if len(data) else 0
-        table = table.sort_values('결측 개수', ascending=False)
-        st.dataframe(table.round(2), hide_index=True, width='stretch')
-        nonzero = table.loc[table['결측 개수'] > 0]
-        if nonzero.empty:
-            st.success('결측치가 없습니다.')
-        else:
-            st.plotly_chart(px.bar(nonzero, x='열 이름', y='결측 개수', hover_data=['결측 비율 (%)']), width='stretch')
-        st.caption('빈 칸, 공백만 있는 칸, pandas가 기본 결측 표기로 인식하는 값(예: NaN, N/A)을 결측값으로 계산합니다.')
-    with distribution:
+            st.download_button('기초통계표 다운로드', summary.to_csv().encode('utf-8-sig'), 'statistics.csv', key=key+'_download')
+        st.caption('표준편차는 표본 표준편차입니다. 원본의 음수 모델 크기 등도 이 표에는 그대로 포함합니다.')
+    with t3:
+        missing = pd.DataFrame({'열': d.columns, '결측 수': d.isna().sum().values})
+        missing['결측 비율 (%)'] = missing['결측 수'] / max(len(d), 1) * 100
+        st.dataframe(missing.round(2), hide_index=True, width='stretch')
+        if missing['결측 수'].sum():
+            chart(px.bar(missing[missing['결측 수'] > 0], x='열', y='결측 수'))
+    with t4:
+        numeric = d.select_dtypes('number').columns.tolist()
         if numeric:
-            selected = st.selectbox('살펴볼 수치형 열', numeric, index=numeric.index('IFEval') if 'IFEval' in numeric else 0)
-            values = data.loc[np.isfinite(data[selected]), [selected]]
-            if values.empty:
-                st.info('그래프에 표시할 유효한 수치가 없습니다.')
-            else:
-                bins = st.slider('히스토그램 구간 수', 5, 80, 30)
-                st.plotly_chart(px.histogram(values, x=selected, nbins=bins, labels={'count': '기록 수'}), width='stretch')
-                st.plotly_chart(px.box(values, y=selected, points='outliers'), width='stretch')
-                st.caption('상자 중앙선은 중앙값, 상자는 가운데 50%입니다. 수염 밖의 점은 사분위 범위의 1.5배 기준 이상치이며 삭제하지 않았습니다.')
-        categorical = data.select_dtypes(exclude='number').columns.tolist()
-        if categorical:
-            selected_cat = st.selectbox('살펴볼 범주형 열', categorical, index=categorical.index('Type') if 'Type' in categorical else 0)
-            frequencies = data[selected_cat].astype('string').fillna('(결측)').value_counts().rename_axis('값').reset_index(name='기록 수')
-            st.caption('기록 수가 많은 상위 20개 값을 표시합니다. 원본의 True/False 값은 범주로 취급합니다.')
-            st.dataframe(frequencies.head(20), hide_index=True, width='stretch')
-            st.plotly_chart(px.bar(frequencies.head(20), x='값', y='기록 수'), width='stretch')
+            target = TARGET if TARGET in numeric else 'IFEval'
+            col = st.selectbox('수치형 열', numeric, index=numeric.index(target) if target in numeric else 0, key=key+'_number')
+            values = d.loc[np.isfinite(d[col])]
+            chart(px.histogram(values, x=col, nbins=30))
+            chart(px.box(values, y=col, points='outliers'))
+        categories = d.select_dtypes(exclude='number').columns.tolist()
+        if categories:
+            col = st.selectbox('범주형 열', categories, key=key+'_category')
+            table = d[col].astype('string').fillna('(결측)').value_counts().head(20).rename_axis('값').reset_index(name='기록 수')
+            chart(px.bar(table, x='값', y='기록 수'))
 
 
-GROUP = '대화용 여부'
-SIZE = '모델 크기(B)'
-SCORES = ['지시 수행 점수', '추론 점수', '수학 점수']
-ORDER = ['사전학습', '대화용']
-COLORS = {'사전학습': '#64748B', '대화용': '#2563EB'}
-SIZE_LABELS = ['3B 미만', '3~10B 미만', '10~30B 미만', '30~70B 미만', '70B 이상']
-
-
-def prepare_topic(raw):
-    required = ['모델명', GROUP, SIZE] + SCORES
-    missing = [c for c in required if c not in raw.columns]
-    if missing:
-        raise ValueError('전처리 CSV에 필요한 열이 없습니다: ' + ', '.join(missing))
-    data = raw.copy()
-    data[GROUP] = data[GROUP].astype('string').str.strip()
-    for col in [SIZE] + SCORES:
-        data[col] = pd.to_numeric(data[col], errors='coerce')
-    # 화면에서 제외한 행 수를 공개합니다. 원본 CSV 파일은 수정하지 않습니다.
-    valid = data[GROUP].isin(ORDER) & np.isfinite(data[SIZE]) & (data[SIZE] > 0)
-    for col in SCORES:
-        valid &= np.isfinite(data[col]) & data[col].between(0, 100)
-    return data.loc[valid].copy(), int((~valid).sum())
-
-
-def add_size_groups(data):
-    result = data.copy()
-    result['크기 구간'] = pd.cut(result[SIZE], bins=[0, 3, 10, 30, 70, np.inf],
-                                labels=SIZE_LABELS, right=False)
-    return result
-
-
-def render_topic():
-    st.title('주제별 시각화 · 두 유형의 평가 점수 비교')
-    st.write('대화용으로 학습된 AI와 사전학습 기본 AI는 평가 점수에서 어떤 차이를 보일까?')
-    st.caption('전처리 데이터: data/llm_project_data_cleaned.csv · IFEval은 명시된 답변 조건의 수행 정도이며, 사실 정확성과는 다른 지표입니다.')
-    try:
-        raw = load_data('llm_project_data_cleaned.csv')
-        data, excluded = prepare_topic(raw)
-    except Exception as exc:
-        st.error(f'전처리 데이터를 읽지 못했습니다. data 폴더의 파일명과 열 이름을 확인하세요. {exc}')
-        return
-    if data.empty:
-        st.warning('시각화할 유효한 기록이 없습니다.')
-        return
-    counts = data[GROUP].value_counts().reindex(ORDER, fill_value=0)
-    c1, c2, c3 = st.columns(3)
-    c1.metric('분석 모델 수', f'{len(data):,}')
-    c2.metric('사전학습', f"{counts['사전학습']:,}")
-    c3.metric('대화용', f"{counts['대화용']:,}")
-    st.caption(f'파일 {len(raw):,}행·{len(raw.columns)}열 중 유형·크기·점수 오류로 화면에서 제외한 행: {excluded:,}개')
-    if data['모델명'].duplicated().any():
-        st.warning('동일 모델명이 반복되어 있습니다. 현재 그래프는 행 단위이므로 전처리 파일을 확인하세요.')
-    with st.expander('속성별 데이터 유형과 시각화 선정 이유'):
+def data_page(data):
+    st.title('② 데이터 보기')
+    st.markdown('[출처: Hugging Face Open LLM Leaderboard contents](https://huggingface.co/datasets/open-llm-leaderboard/contents)')
+    section = st.radio('살펴볼 내용', ['전처리 데이터', '원본 기초통계', '전처리 근거', '주제별 그래프'], horizontal=True)
+    if section == '원본 기초통계':
+        try:
+            basic_stats(load_data('open_llm_leaderboard.csv'), 'original')
+        except Exception as e:
+            st.error(f'원본을 읽지 못했습니다: {e}')
+    elif section == '전처리 데이터':
+        basic_stats(data, 'cleaned')
+        st.caption('모델명은 식별자, 크기·세 평가 점수는 수치형, 유형·구조·정밀도·대화 형식은 범주형입니다. 구조의 결측치는 현재 예측에 영향을 주지 않습니다.')
+    elif section == '전처리 근거':
         st.dataframe(pd.DataFrame([
-            ['모델명', '식별용 텍스트', '표', '개별 모델과 반복 기록 확인'],
-            [GROUP, '범주형 · 명목형', '막대그래프 / 박스플롯의 집단', '유형 구성과 점수 차이'],
-            [SIZE, '수치형', '크기 구간별 박스플롯', '비슷한 크기에서도 유형 차이가 유지되는지'],
-            *[[score, '수치형', '유형별 박스플롯', '중앙값·산포·분포의 겹침'] for score in SCORES],
-            ['모델 구조·수치 정밀도·대화 형식 사용', '범주형 · 명목형', '빈도표 (데이터 확인)', '평가 조건과 구성 확인'],
-        ], columns=['속성', '데이터 유형', '표현 방법', '확인할 내용']), hide_index=True, width='stretch')
+            ['원본', 0, 4576, '36열의 전체 평가 기록'], ['네 유형 선택', 74, 4502, '지속 사전학습·멀티모달·기타 제외'],
+            ['유효성 점검', 3, 4499, '양수가 아닌 크기 제외; 세 점수의 유효 범위 점검'],
+            ['유형 충돌 제외', 58, 4441, '원본 전체에서 같은 모델명에 여러 유형'],
+            ['반복 평가 정리', 47, 4394, '원본 순서의 첫 기록 유지'],
+            ['크기 범위 제한', 273, 4121, 'Q3+3IQR=30.809B 초과 제외'],
+        ], columns=['단계', '제외 행', '남은 행', '근거']), hide_index=True, width='stretch')
+        st.write('크기의 Q1=6.061B, Q3=12.248B, IQR=6.187B입니다. 점수가 높거나 낮다는 이유만으로 삭제하지 않았으며, IFEval Raw는 IFEval을 100으로 나눈 중복 정보여서 제외했습니다.')
+        st.warning('크기 울타리 밖에도 정상 모델이 있습니다. 이것은 오류 제거의 증명이 아닌 범위 제한입니다. 현재 전처리 CSV의 기록이므로 데이터가 바뀌면 전처리 근거도 다시 확인해야 합니다.')
+        if len(data) != 4121:
+            st.warning('현재 CSV 행 수가 기록된 4,121행과 다릅니다. 전처리 기록을 갱신하세요.')
+    else:
+        counts = data[TYPE].value_counts().reindex(TYPES, fill_value=0).rename_axis(TYPE).reset_index(name='모델 수')
+        chart(px.bar(counts, x=TYPE, y='모델 수', color=TYPE, text='모델 수', color_discrete_map=COLORS))
+        chart(px.box(data, x=TYPE, y=TARGET, color=TYPE, category_orders={TYPE: TYPES}, color_discrete_map=COLORS, points='outliers'))
+        st.caption('상자 중앙선은 중앙값, 상자는 가운데 50%입니다. 수염 밖 점도 분석에는 포함합니다.')
+        chart(px.scatter(data, x=SIZE, y=TARGET, color=TYPE, hover_name='모델명', opacity=.45, color_discrete_map=COLORS))
+        st.dataframe(data.groupby(TYPE)[TARGET].agg(['count', 'mean', 'median', 'std']).round(2), width='stretch')
+        st.caption('유형별 분포와 크기–점수 관계를 살펴보는 탐색 그래프이며, 유형 차이의 인과 효과를 입증하지 않습니다.')
 
-    st.subheader('1. 유형별 모델 수')
-    frequencies = counts.rename_axis(GROUP).reset_index(name='모델 수')
-    frequencies['비율 (%)'] = frequencies['모델 수'] / len(data) * 100
-    fig = px.bar(frequencies, x=GROUP, y='모델 수', color=GROUP, text='모델 수',
-                 color_discrete_map=COLORS, category_orders={GROUP: ORDER}, hover_data=['비율 (%)'])
-    fig.update_layout(showlegend=False, height=340)
-    fig.update_yaxes(rangemode='tozero')
-    st.plotly_chart(fig, width='stretch')
-    st.dataframe(frequencies.round(2), hide_index=True, width='stretch')
-    st.info('두 집단의 수가 다르므로 단순 빈도 대신 점수 분포를 비교합니다. 이후 분류 평가에서는 다수 유형만 예측하는 기준선도 함께 확인해야 합니다.')
 
-    st.subheader('2. 유형별 평가 점수 박스플롯')
-    points = st.checkbox('모든 모델의 관측점 표시', value=False, key='topic_points')
-    st.caption('중앙선: 중앙값 · 상자: 가운데 50% · 수염 밖 점: 사분위 범위 1.5배 기준 이상치. 점을 숨겨도 계산에는 모두 포함됩니다.')
-    summary_rows = []
-    for score, container in zip(SCORES, st.columns(3)):
-        with container:
-            fig = px.box(data, x=GROUP, y=score, color=GROUP, points='all' if points else 'outliers',
-                         hover_name='모델명', hover_data=[SIZE], category_orders={GROUP: ORDER},
-                         color_discrete_map=COLORS, title=score)
-            fig.update_layout(showlegend=False, height=420, xaxis_title='모델 유형')
-            fig.update_yaxes(range=[-3, 103])
-            st.plotly_chart(fig, width='stretch')
-        for group in ORDER:
-            values = data.loc[data[GROUP] == group, score]
-            summary_rows.append({'평가': score, '유형': group, '모델 수': len(values),
-                                 '평균': values.mean(), '중앙값': values.median(),
-                                 '1사분위수': values.quantile(.25), '3사분위수': values.quantile(.75),
-                                 '표준편차': values.std()})
-    summary = pd.DataFrame(summary_rows)
-    st.dataframe(summary.round(2), hide_index=True, width='stretch')
-    for score in SCORES:
-        rows = summary[summary['평가'] == score].set_index('유형')
-        if rows['모델 수'].min() > 0:
-            gap = rows.loc['대화용', '중앙값'] - rows.loc['사전학습', '중앙값']
-            st.write(f"• {score}: 중앙값은 사전학습 {rows.loc['사전학습', '중앙값']:.2f}점, "
-                     f"대화용 {rows.loc['대화용', '중앙값']:.2f}점이며, 차이(대화용 − 사전학습)는 {gap:+.2f}점입니다.")
-    st.caption('세 평가는 문항 구성과 난도가 다릅니다. 각 평가 안에서 유형을 비교하며, 평가 간 원점수 차이를 능력 차이의 크기로 직접 비교하지 않습니다.')
+def split_table(data, result):
+    a = data.iloc[result['train_idx']][TYPE].value_counts()
+    b = data.iloc[result['test_idx']][TYPE].value_counts()
+    return pd.DataFrame({'학습': a, '테스트': b}).reindex(TYPES).fillna(0).astype(int)
 
-    st.subheader('3. 모델 크기 구간별 지시 수행 점수')
-    grouped = add_size_groups(data)
-    fig = px.box(grouped, x='크기 구간', y=SCORES[0], color=GROUP,
-                 category_orders={'크기 구간': SIZE_LABELS, GROUP: ORDER},
-                 color_discrete_map=COLORS, points='all' if points else 'outliers',
-                 hover_name='모델명', hover_data=[SIZE])
-    fig.update_layout(height=480, boxmode='group', legend_title='모델 유형')
-    fig.update_yaxes(range=[-3, 103])
-    st.plotly_chart(fig, width='stretch')
-    group_summary = grouped.groupby(['크기 구간', GROUP], observed=False)[SCORES[0]].agg(
-        모델수='count', 평균='mean', 중앙값='median').reset_index()
-    st.dataframe(group_summary.round(2), hide_index=True, width='stretch')
-    comparisons = []
-    for label in SIZE_LABELS:
-        rows = group_summary[group_summary['크기 구간'] == label].set_index(GROUP)
-        n0, n1 = int(rows.loc['사전학습', '모델수']), int(rows.loc['대화용', '모델수'])
-        gap = rows.loc['대화용', '중앙값'] - rows.loc['사전학습', '중앙값'] if min(n0, n1) else np.nan
-        comparisons.append({'크기 구간': label, '사전학습 수': n0, '대화용 수': n1,
-                            '중앙값 차이 (대화용−사전학습)': gap,
-                            '해석 주의': '한 유형 없음' if min(n0, n1) == 0 else ('한 유형이 10개 미만' if min(n0, n1) < 10 else '두 유형 비교 가능')})
-    st.dataframe(pd.DataFrame(comparisons).round(2), hide_index=True, width='stretch')
-    st.caption('B는 10억 개 매개변수입니다. 구간은 [0,3), [3,10), [10,30), [30,70), [70,∞)이며 경계값은 오른쪽 구간에 속합니다. 10개는 주의를 돕는 표시 기준이며 통계적 유의성을 판정하는 기준이 아닙니다.')
-    st.warning('같은 구간에도 크기가 다른 모델이 포함됩니다. 구간별 비교는 크기의 영향을 완전히 통제하지 않으며, 적은 모델로 구성된 집단은 결과가 불안정할 수 있습니다.')
-    with st.expander('해석·한계와 분석 데이터 확인'):
-        st.write('이 그래프는 공개 데이터 안의 관찰된 차이를 보여줍니다. 유형별 차이가 있더라도 대화용 학습의 인과 효과를 입증하지는 않습니다. 모델 구조·학습 데이터·평가 형식 등이 함께 영향을 줄 수 있습니다.')
-        st.write('전처리 시 반복 평가 중 원본 순서의 첫 기록만 유지했으므로 평가 조건 정보가 일부 손실될 수 있습니다. 동일 계열 모델도 여러 개 포함되어 있습니다.')
-        st.write('현재는 데이터 탐색 단계입니다. 기준선·분류 모델·테스트 성능은 아직 계산하지 않았습니다. 그래프만으로 분류 성능을 확정할 수 없습니다.')
-        st.dataframe(data, hide_index=True, width='stretch')
-    st.download_button('유형별 점수 요약표 다운로드', summary.to_csv(index=False).encode('utf-8-sig'),
-                       file_name='type_score_summary.csv', mime='text/csv')
+
+def baseline_page(data, result):
+    st.title('③ 기준선')
+    st.write('아무 특징도 보지 않고 모든 모델에 학습 데이터의 평균 점수를 답하는 방법입니다. 크기·유형 정보가 도움이 되는지 판단할 출발점입니다.')
+    st.write(f"전체 {len(data):,}개 → 학습 {len(result['train_idx']):,}개 / 테스트 {len(result['test_idx']):,}개. 유형 비율을 보존한 8:2 분할이며 난수 시드는 {SEED}입니다.")
+    st.dataframe(split_table(data, result), width='stretch')
+    baseline = result['scores'].loc['평균 기준선']
+    c = st.columns(3)
+    c[0].metric('학습 평균 = 모든 예측값', f"{result['training_mean']:.2f}점")
+    c[1].metric('테스트 MAE', f"{baseline['테스트 MAE']:.2f}점")
+    c[2].metric('테스트 R²', f"{baseline['테스트 R²']:.3f}")
+    fig = px.histogram(data.iloc[result['test_idx']], x=TARGET, nbins=30)
+    fig.add_vline(x=result['training_mean'], line_dash='dash', annotation_text='학습 평균 기준선')
+    chart(fig)
+    st.write('MAE는 실제와 예측의 차이를 절댓값으로 계산한 평균이며 낮을수록 좋습니다. R²는 테스트 점수의 분산 대비 제곱오차를 평가하며 높을수록 좋고 음수도 가능합니다.')
+    st.caption('테스트 R²의 0 기준은 테스트 평균 예측입니다. 학습 평균을 사용하는 우리 기준선의 테스트 R²는 정확히 0이 아닐 수 있습니다. 평가 데이터의 정답 평균을 예측값으로 사용하지 않습니다.')
+    st.warning('행 단위 분할이라 같은 기본 모델에서 파생된 다른 모델이 양쪽에 있을 수 있습니다. ⑤에서 제작자 단위 분할을 보조 점검하며, 이것도 완전한 계열 분리는 아닙니다.')
+
+
+def coefficient_table(result):
+    model = result['models']['선형 회귀 · 크기+유형']
+    reg = model.named_steps['예측']
+    return pd.DataFrame({'항목': ['모델 크기 1B 증가'] + [t+' (사전학습 대비)' for t in TYPES[1:]],
+                         '계수 (점)': reg.coef_})
+
+
+def results_page(data, result):
+    st.title('④ 모델 결과')
+    st.write('학습 데이터 내부에서 유형 비율을 보존한 3겹 교차검증을 수행했습니다. 평균 기준선을 제외한 후보 중 교차검증 MAE가 가장 낮은 모델을 선택하고, 동일한 별도 테스트 데이터에서 평가합니다.')
+    st.success('교차검증으로 선택한 모델: ' + result['selected'])
+    st.dataframe(result['scores'].round(4), width='stretch')
+    st.caption('교차검증 표준편차는 3개 검증 폴드의 MAE 차이이며 신뢰구간이 아닙니다. 각 폴드 안에서 전처리 변환과 모델을 다시 학습합니다. 테스트 결과로 후보를 선택하지 않습니다.')
+    with st.expander('모델 설정과 실제 분석 순서'):
+        st.write('선형 회귀는 절편 포함 최소제곱법입니다. 유형은 사전학습을 기준으로 원핫 인코딩하며 크기는 B 단위 원값을 사용합니다. 랜덤 포레스트는 150그루, 최대 깊이 8, 잎 최소 표본 5, 시드 42로 고정하고 추가 튜닝하지 않습니다.')
+        st.write('CSV 읽기 → 핵심 열 유효성 점검 → 8:2 분할 → 학습 데이터 안 3겹 검증 → 후보 선택 → 전체 학습분으로 재학습 → 테스트 평가 → 오차 해석 순서입니다. 예측값을 0~100으로 잘라 성능을 개선하지 않습니다.')
+    bars = result['scores'][['학습 MAE', '교차검증 MAE', '테스트 MAE']].reset_index().melt(id_vars='모델', var_name='평가 구분', value_name='MAE (점)')
+    chart(px.bar(bars, x='모델', y='MAE (점)', color='평가 구분', barmode='group'))
+    name = st.selectbox('자세히 살펴볼 모델', list(result['scores'].index), index=list(result['scores'].index).index(result['selected']))
+    points = data.iloc[result['test_idx']][['모델명', SIZE, TYPE, TARGET]].copy()
+    points['예측 점수'] = result['predictions'][name]
+    points['잔차 (실제−예측)'] = points[TARGET] - points['예측 점수']
+    fig = px.scatter(points, x=TARGET, y='예측 점수', color=TYPE, hover_name='모델명', hover_data=[SIZE], color_discrete_map=COLORS, opacity=.6)
+    lo = min(0, points['예측 점수'].min()); hi = max(100, points['예측 점수'].max())
+    fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], name='정확한 예측선', mode='lines', line=dict(color='black', dash='dash')))
+    chart(fig)
+    st.caption('대각선에 가까울수록 정확합니다. 위쪽은 과대예측, 아래쪽은 과소예측입니다.')
+    fig = px.scatter(points, x='예측 점수', y='잔차 (실제−예측)', color=TYPE, hover_name='모델명', color_discrete_map=COLORS, opacity=.6)
+    fig.add_hline(y=0, line_dash='dash'); chart(fig)
+    st.caption('잔차가 양수면 실제보다 낮게 예측했습니다. 특정 점수대에 오차가 몰리는지 확인합니다.')
+    st.subheader('선형 회귀를 식으로 해석하기')
+    st.dataframe(coefficient_table(result).round(4), hide_index=True, width='stretch')
+    intercept = result['models']['선형 회귀 · 크기+유형'].named_steps['예측'].intercept_
+    st.write(f'예측 점수 = {intercept:.3f} + 크기 계수 × 모델 크기(B) + 해당 유형 계수')
+    st.caption('사전학습의 유형 계수는 0입니다. 유형 간 기울기는 같다는 가정이며, 계수는 다른 입력을 고정한 관찰 관계이지 학습 방식의 인과 효과가 아닙니다. 크기 0의 절편은 범위 밖이므로 실질적 능력으로 해석하지 않습니다.')
+    st.download_button('모델 비교표 CSV', result['scores'].to_csv().encode('utf-8-sig'), 'regression_scores.csv')
+    st.download_button('선택 모델 테스트 예측 CSV', result['test'].to_csv(index=False).encode('utf-8-sig'), 'test_predictions.csv')
+
+
+@st.cache_data(show_spinner='추가 분할·크기 범위 점검 중입니다…')
+def robustness(data, selected, kind):
+    if kind == '제작자 분할':
+        d = data
+        groups = d['모델명'].str.split('/').str[0]
+        a, b = next(GroupShuffleSplit(n_splits=1, test_size=.2, random_state=SEED).split(d, groups=groups))
+        model = make_model(selected).fit(d.iloc[a][[SIZE, TYPE]], d.iloc[a][TARGET])
+        pred = model.predict(d.iloc[b][[SIZE, TYPE]])
+        baseline = np.repeat(d.iloc[a][TARGET].mean(), len(b))
+        return pd.DataFrame([['제작자 분할 · 선택 모델', len(a), len(b), *metrics(d.iloc[b][TARGET], pred)],
+                             ['제작자 분할 · 평균 기준선', len(a), len(b), *metrics(d.iloc[b][TARGET], baseline)]],
+                            columns=['조건', '학습 수', '테스트 수', 'MAE', 'R²'])
+    raw = load_data('open_llm_leaderboard.csv')
+    d = raw[raw.Type.isin(LABELS)].copy()
+    valid = d['#Params (B)'].gt(0) & np.isfinite(d['#Params (B)'])
+    for col in ['IFEval', 'BBH', 'MATH Lvl 5']:
+        valid &= np.isfinite(d[col]) & d[col].between(0, 100)
+    conflicts = raw.groupby('fullname').Type.nunique().loc[lambda x:x > 1].index
+    d = d[valid & ~d.fullname.isin(conflicts)].drop_duplicates('fullname').rename(columns=RENAMES)
+    d[TYPE] = d[TYPE].map(LABELS)
+    # 크기 제한의 영향만 비교: 큰 모델도 있는 하나의 고정 테스트 분할을 두 학습 조건에 공통 사용.
+    a, b = train_test_split(np.arange(len(d)), test_size=.2, random_state=SEED, stratify=d[TYPE])
+    training, test = d.iloc[a], d.iloc[b]
+    rows = []
+    for condition, train in [('전체 크기로 학습', training), ('30.809B 이하만 학습', training[training[SIZE] <= CAP])]:
+        model = make_model(selected).fit(train[[SIZE, TYPE]], train[TARGET])
+        pred = model.predict(test[[SIZE, TYPE]])
+        for label, mask in [('공통 테스트 전체', np.ones(len(test), dtype=bool)), ('30.809B 이하', (test[SIZE] <= CAP).to_numpy()), ('30.809B 초과', (test[SIZE] > CAP).to_numpy())]:
+            if mask.sum() > 1:
+                rows.append([condition, label, len(train), int(mask.sum()), *metrics(test[TARGET].to_numpy()[mask], pred[mask])])
+    return pd.DataFrame(rows, columns=['학습 조건', '테스트 범위', '학습 수', '테스트 수', 'MAE', 'R²'])
+
+
+def interpretation_page(data, result):
+    st.title('⑤ 해석·한계')
+    scores = result['scores']; name = result['selected']; test = result['test']
+    base = scores.loc['평균 기준선', '테스트 MAE']; selected = scores.loc[name]
+    improvement = (base-selected['테스트 MAE']) / base*100 if base else np.nan
+    st.subheader('자동 계산된 해석 근거 — 발표 문장은 직접 검토하기')
+    st.write(f"선택 모델의 테스트 MAE는 {selected['테스트 MAE']:.2f}점, R²는 {selected['테스트 R²']:.3f}입니다. 평균 기준선 대비 MAE 감소율은 {improvement:.1f}%입니다(음수면 악화).")
+    st.caption('어느 정도면 충분한 예측인지는 용도에 따라 다릅니다. 임의의 R² 문턱으로 성공·실패를 단정하지 않습니다.')
+    gain = scores.loc['선형 회귀 · 크기만', '교차검증 MAE'] - scores.loc['선형 회귀 · 크기+유형', '교차검증 MAE']
+    st.write(f'발견 후보 1 · 유형 정보의 도움: 선형 회귀에 유형을 추가했을 때 교차검증 MAE가 {gain:+.2f}점 줄었습니다(음수면 악화).')
+    difference = scores.loc['선형 회귀 · 크기+유형', '테스트 MAE'] - scores.loc['랜덤 포레스트 · 크기+유형', '테스트 MAE']
+    st.write(f'발견 후보 2 · 복잡한 관계의 도움: 같은 입력에서 랜덤 포레스트의 테스트 MAE는 선형 회귀보다 {difference:+.2f}점 작았습니다(음수면 더 큼). 이 차이의 통계적 유의성은 확인하지 않았습니다.')
+    bytype = test.groupby(TYPE).agg(모델수=('절대 오차', 'size'), MAE=('절대 오차', 'mean'), 평균잔차=('잔차 (실제−예측)', 'mean'))
+    worst = bytype.MAE.idxmax()
+    st.write(f'발견 후보 3 · 어려운 유형: 선택 모델은 {worst}에서 평균 {bytype.loc[worst, "MAE"]:.2f}점 틀렸습니다. 해당 유형의 테스트 표본은 {bytype.loc[worst, "모델수"]}개입니다.')
+    st.dataframe(bytype.round(3), width='stretch')
+    chart(px.bar(bytype.reset_index(), x=TYPE, y='MAE', color=TYPE, color_discrete_map=COLORS, hover_data=['모델수', '평균잔차']))
+    st.subheader('크게 틀린 사례와 신뢰 범위')
+    st.dataframe(test.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
+    st.write(f"절대 오차가 10점을 넘는 기록: {(test['절대 오차'] > 10).sum()}/{len(test)}개 ({(test['절대 오차'] > 10).mean()*100:.1f}%). 이는 정확도가 아니라 설명을 위한 허용오차 예시입니다.")
+    st.write('이름과 점수만으로 틀린 원인을 확정할 수 없습니다. 구조·학습 데이터·평가 형식 차이 등을 추가로 조사할 후보 사례입니다.')
+    st.subheader('한계')
+    st.write('공개 리더보드의 네 유형과 30.809B 이하 범위에 대한 결과입니다. 최신 비공개 AI나 모든 크기, 전체 지능에 일반화할 수 없습니다. 유형별 모델 수가 불균형하므로 전체 MAE만으로 소수 유형의 성능을 판단하지 않습니다.')
+    st.write('전처리에서 메타데이터 충돌을 제외하고 반복 평가의 첫 기록을 유지했습니다. 원본에 있던 크기·평가 조건의 다양성이 줄었으며, 모델 유형은 제작 방식에 대한 분류이지 순수한 학습량이 아닙니다. 계수나 중요도를 학습의 인과 효과로 해석할 수 없습니다.')
+    st.write('크기 범위는 탐색용 전체 데이터의 분포에서 정해진 조건입니다. 엄격한 새 데이터 평가에서는 학습분으로만 전처리 기준을 정하거나, 미리 정한 범위를 명시하고 제한 전 테스트 성능도 함께 제시해야 합니다. 테스트 결과를 본 뒤 계속 모델을 바꾸면 현재 테스트 성능은 최종 검증으로 재사용할 수 없습니다.')
+    st.subheader('추가 검증')
+    check = st.selectbox('점검할 조건', ['제작자 분할', '크기 제한 전후'])
+    st.caption('제작자는 모델명의 / 앞부분으로 추정하며, 제작자가 달라도 같은 계열일 수 있습니다. 크기 비교는 제한 전 유효 데이터에서 공통 테스트를 고정하고 학습 크기 범위만 바꿉니다. 메인 평가와 다른 실험이므로 숫자를 섞어 인용하지 않습니다.')
+    if st.button('추가 검증 실행'):
+        try:
+            st.dataframe(robustness(data, name, check).round(4), hide_index=True, width='stretch')
+        except Exception as e:
+            st.error(f'추가 검증 실패: {e}')
+    st.subheader('참고·AI 활용')
+    st.markdown('[데이터 출처](https://huggingface.co/datasets/open-llm-leaderboard/contents) · [평가 방법](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about) · [점수 환산](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/normalization) · [IFEval 논문](https://arxiv.org/abs/2311.07911)')
+    st.write('생성형 AI를 코드 작성과 설명 초안에 사용했습니다. 발표 전 계산표·실행 결과를 확인하고 최종 해석과 결론은 작성자가 검토해야 합니다. 아래 버전은 현재 실행 환경에서 직접 읽은 값입니다.')
+    import sklearn
+    st.caption(f'라이브러리: pandas {pd.__version__} · NumPy {np.__version__} · scikit-learn {sklearn.__version__} · Streamlit {st.__version__}')
 
 
 def main():
-    st.set_page_config(page_title='공개 언어 모델 분석', page_icon='📊', layout='wide')
+    st.set_page_config(page_title='AI의 지시 수행 점수 예측', page_icon='📊', layout='wide')
+    pages = ['① 질문', '② 데이터 보기', '③ 기준선', '④ 모델 결과', '⑤ 해석·한계']
     with st.sidebar:
-        st.title('공개 언어 모델 분석')
-        page = st.radio('화면 선택', ['원본 데이터 · 기초통계', '전처리 데이터 · 주제별 시각화'], key='navigation')
-        if st.button('최신 데이터 다시 불러오기'):
-            load_data.clear()
-        st.caption('원본의 구성 확인 → 전처리 데이터로 유형별 비교')
-    if page == '원본 데이터 · 기초통계':
-        render_original()
+        st.title('AI 지시 수행 점수 예측')
+        page = st.radio('발표 흐름', pages)
+        st.caption('모델 크기 + 모델 유형 → IFEval 점수')
+        if st.button('데이터·학습 결과 새로고침'):
+            load_data.clear(); fit_experiment.clear(); robustness.clear()
+        st.caption('고정 시드 42 · 학습 80% / 테스트 20% · 학습 안 3겹 교차검증')
+    try:
+        data = checked_data(load_data('llm_project_data_cleaned.csv'))
+    except Exception as e:
+        st.error(f'전처리 CSV를 불러올 수 없습니다: {e}')
+        st.stop()
+    if data[SIZE].max() > CAP + 1e-9:
+        st.error('현재 CSV가 기록된 30.809B 분석 범위를 초과합니다. 파일과 전처리 설명을 맞춰 주세요.')
+        st.stop()
+    if page == pages[0]:
+        question_page(data)
+    elif page == pages[1]:
+        data_page(data)
     else:
-        render_topic()
-    # 최종 발표 앱 확장: ① 질문 ② 데이터 보기 ③ 기준선 ④ 모델 결과 ⑤ 해석·한계.
-    # 현재 두 화면은 ② 데이터 보기의 원본 탐색/전처리 후 시각화에 해당합니다.
+        result = fit_experiment(data)
+        if page == pages[2]:
+            baseline_page(data, result)
+        elif page == pages[3]:
+            results_page(data, result)
+        else:
+            interpretation_page(data, result)
 
 
 if __name__ == '__main__':
