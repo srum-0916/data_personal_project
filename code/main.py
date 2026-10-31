@@ -61,11 +61,11 @@ def checked_data(raw):
     return d.reset_index(drop=True)
 
 
-def make_model(name):
+def make_model(name, extras=()):
     if name == '평균 기준선':
         return DummyRegressor(strategy='mean')
     cat = [] if name == '선형 회귀 · 크기만' else [TYPE]
-    transforms = [('크기', 'passthrough', [SIZE])]
+    transforms = [('수치', 'passthrough', [SIZE] + list(extras))]
     if cat:
         transforms.append(('유형', OneHotEncoder(categories=[TYPES], drop='first', handle_unknown='ignore', sparse_output=False), cat))
     prep = ColumnTransformer(transforms, remainder='drop')
@@ -129,13 +129,11 @@ def question_page(data):
         ['예측 대상', TARGET, '수치형', 'IFEval 엄격 준수율 두 지표의 평균 × 100'],
     ], columns=['역할', '속성', '자료형', '뜻']), hide_index=True, width='stretch')
     st.write('모델 유형에는 학습 방법과 병합 방법이 함께 포함되어 있어, 이를 하나의 학습량이나 학습 순서로 해석하지 않습니다. 추론·수학 점수, 모델명, 구조, 정밀도, 대화 형식은 이번 예측 입력에 넣지 않습니다.')
-    st.subheader('IFEval 점수의 정확한 의미')
-    st.write('정해진 문장 수, 지정 단어 포함, JSON 형식 등 프로그램으로 확인 가능한 조건을 지켰는지 채점합니다. 개별 조건의 엄격 준수율과 프롬프트의 모든 조건을 지킨 엄격 준수율을 평균합니다.')
-    st.latex(r'\mathrm{IFEval}=100\times\frac{\mathrm{instruction\ strict\ accuracy}+\mathrm{prompt\ strict\ accuracy}}{2}')
-    st.caption('예: 두 준수율이 0.8과 0.6이면 70점입니다. 70점이 곧 질문 70%를 완벽히 수행했다는 뜻은 아닙니다. 사실 정확성·창의성·전체 대화 능력의 종합 점수가 아닙니다.')
-    st.markdown('[공식 평가 설명](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about) · [IFEval 계산에 관한 운영진 답변](https://huggingface.co/spaces/open-llm-leaderboard/open_llm_leaderboard/discussions/911)')
-    st.subheader('검증할 내용')
-    st.write('1. 크기만 사용하는 회귀가 평균 기준선보다 나은가?\n\n2. 모델 유형을 추가하면 검증 오차가 줄어드는가?\n\n3. 복잡한 모델이 더 잘 예측하는가, 어떤 유형과 모델에서 크게 틀리는가?')
+    st.caption('IFEval은 개별 지시의 엄격 준수율과 질문 전체 조건의 엄격 준수율을 평균한 0~100점 지표입니다. 답변의 사실 정확성 전체를 뜻하지 않습니다.')
+    st.markdown('[평가 방법](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about) · [IFEval 계산](https://huggingface.co/spaces/open-llm-leaderboard/open_llm_leaderboard/discussions/911)')
+    st.subheader('추가 실험')
+    st.write('기본 입력에 추론(BBH)·수학(MATH Level 5) 점수를 각각 또는 함께 추가해 예측 성능을 비교합니다.')
+    st.caption('추가 실험은 다른 평가 점수를 이미 알고 있을 때의 예측입니다. 기존 테스트 결과를 확인한 뒤 수행한 후속 탐색이므로 완전히 독립적인 최종 검증은 아닙니다.')
 
 
 def basic_stats(d, key):
@@ -244,6 +242,10 @@ def coefficient_table(result):
 
 def results_page(data, result):
     st.title('④ 모델 결과')
+    experiment = st.radio('실험 선택', ['기본 실험', '추가 실험 · 추론·수학 점수'], horizontal=True)
+    if experiment != '기본 실험':
+        extra_results_page(data, result)
+        return
     st.write('학습 데이터 내부에서 유형 비율을 보존한 3겹 교차검증을 수행했습니다. 평균 기준선을 제외한 후보 중 교차검증 MAE가 가장 낮은 모델을 선택하고, 동일한 별도 테스트 데이터에서 평가합니다.')
     st.success('교차검증으로 선택한 모델: ' + result['selected'])
     st.dataframe(result['scores'].round(4), width='stretch')
@@ -307,44 +309,101 @@ def robustness(data, selected, kind):
     return pd.DataFrame(rows, columns=['학습 조건', '테스트 범위', '학습 수', '테스트 수', 'MAE', 'R²'])
 
 
+def save_note(index):
+    st.session_state[f'note_draft_{index}'] = st.session_state[f'interpretation_{index}']
+
+
 def interpretation_page(data, result):
     st.title('⑤ 해석·한계')
-    scores = result['scores']; name = result['selected']; test = result['test']
-    base = scores.loc['평균 기준선', '테스트 MAE']; selected = scores.loc[name]
-    improvement = (base-selected['테스트 MAE']) / base*100 if base else np.nan
-    st.subheader('자동 계산된 해석 근거 — 발표 문장은 직접 검토하기')
-    st.write(f"선택 모델의 테스트 MAE는 {selected['테스트 MAE']:.2f}점, R²는 {selected['테스트 R²']:.3f}입니다. 평균 기준선 대비 MAE 감소율은 {improvement:.1f}%입니다(음수면 악화).")
-    st.caption('어느 정도면 충분한 예측인지는 용도에 따라 다릅니다. 임의의 R² 문턱으로 성공·실패를 단정하지 않습니다.')
-    gain = scores.loc['선형 회귀 · 크기만', '교차검증 MAE'] - scores.loc['선형 회귀 · 크기+유형', '교차검증 MAE']
-    st.write(f'발견 후보 1 · 유형 정보의 도움: 선형 회귀에 유형을 추가했을 때 교차검증 MAE가 {gain:+.2f}점 줄었습니다(음수면 악화).')
-    difference = scores.loc['선형 회귀 · 크기+유형', '테스트 MAE'] - scores.loc['랜덤 포레스트 · 크기+유형', '테스트 MAE']
-    st.write(f'발견 후보 2 · 복잡한 관계의 도움: 같은 입력에서 랜덤 포레스트의 테스트 MAE는 선형 회귀보다 {difference:+.2f}점 작았습니다(음수면 더 큼). 이 차이의 통계적 유의성은 확인하지 않았습니다.')
-    bytype = test.groupby(TYPE).agg(모델수=('절대 오차', 'size'), MAE=('절대 오차', 'mean'), 평균잔차=('잔차 (실제−예측)', 'mean'))
-    worst = bytype.MAE.idxmax()
-    st.write(f'발견 후보 3 · 어려운 유형: 선택 모델은 {worst}에서 평균 {bytype.loc[worst, "MAE"]:.2f}점 틀렸습니다. 해당 유형의 테스트 표본은 {bytype.loc[worst, "모델수"]}개입니다.')
-    st.dataframe(bytype.round(3), width='stretch')
-    chart(px.bar(bytype.reset_index(), x=TYPE, y='MAE', color=TYPE, color_discrete_map=COLORS, hover_data=['모델수', '평균잔차']))
-    st.subheader('크게 틀린 사례와 신뢰 범위')
-    st.dataframe(test.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
-    st.write(f"절대 오차가 10점을 넘는 기록: {(test['절대 오차'] > 10).sum()}/{len(test)}개 ({(test['절대 오차'] > 10).mean()*100:.1f}%). 이는 정확도가 아니라 설명을 위한 허용오차 예시입니다.")
-    st.write('이름과 점수만으로 틀린 원인을 확정할 수 없습니다. 구조·학습 데이터·평가 형식 차이 등을 추가로 조사할 후보 사례입니다.')
-    st.subheader('한계')
-    st.write('공개 리더보드의 네 유형과 30.809B 이하 범위에 대한 결과입니다. 최신 비공개 AI나 모든 크기, 전체 지능에 일반화할 수 없습니다. 유형별 모델 수가 불균형하므로 전체 MAE만으로 소수 유형의 성능을 판단하지 않습니다.')
-    st.write('전처리에서 메타데이터 충돌을 제외하고 반복 평가의 첫 기록을 유지했습니다. 원본에 있던 크기·평가 조건의 다양성이 줄었으며, 모델 유형은 제작 방식에 대한 분류이지 순수한 학습량이 아닙니다. 계수나 중요도를 학습의 인과 효과로 해석할 수 없습니다.')
-    st.write('크기 범위는 탐색용 전체 데이터의 분포에서 정해진 조건입니다. 엄격한 새 데이터 평가에서는 학습분으로만 전처리 기준을 정하거나, 미리 정한 범위를 명시하고 제한 전 테스트 성능도 함께 제시해야 합니다. 테스트 결과를 본 뒤 계속 모델을 바꾸면 현재 테스트 성능은 최종 검증으로 재사용할 수 없습니다.')
-    st.subheader('추가 검증')
-    check = st.selectbox('점검할 조건', ['제작자 분할', '크기 제한 전후'])
-    st.caption('제작자는 모델명의 / 앞부분으로 추정하며, 제작자가 달라도 같은 계열일 수 있습니다. 크기 비교는 제한 전 유효 데이터에서 공통 테스트를 고정하고 학습 크기 범위만 바꿉니다. 메인 평가와 다른 실험이므로 숫자를 섞어 인용하지 않습니다.')
-    if st.button('추가 검증 실행'):
-        try:
-            st.dataframe(robustness(data, name, check).round(4), hide_index=True, width='stretch')
-        except Exception as e:
-            st.error(f'추가 검증 실패: {e}')
-    st.subheader('참고·AI 활용')
-    st.markdown('[데이터 출처](https://huggingface.co/datasets/open-llm-leaderboard/contents) · [평가 방법](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/about) · [점수 환산](https://huggingface.co/docs/leaderboards/open_llm_leaderboard/normalization) · [IFEval 논문](https://arxiv.org/abs/2311.07911)')
-    st.write('생성형 AI를 코드 작성과 설명 초안에 사용했습니다. 발표 전 계산표·실행 결과를 확인하고 최종 해석과 결론은 작성자가 검토해야 합니다. 아래 버전은 현재 실행 환경에서 직접 읽은 값입니다.')
-    import sklearn
-    st.caption(f'라이브러리: pandas {pd.__version__} · NumPy {np.__version__} · scikit-learn {sklearn.__version__} · Streamlit {st.__version__}')
+    st.caption('그래프와 수치를 확인한 뒤 직접 작성하세요. 입력한 글은 다운로드해 보관할 수 있습니다.')
+    fields = ['기본 실험 해석', '추가 실험 해석', '최종 결론', '한계와 더 해 보고 싶은 것']
+    notes = []
+    for i, label in enumerate(fields):
+        value = st.text_area(label, value=st.session_state.get(f'note_draft_{i}', ''), height=150,
+                             key=f'interpretation_{i}', on_change=save_note, args=(i,))
+        notes.append(label + '\n' + value)
+    st.download_button('내 해석 다운로드', '\n\n'.join(notes).encode('utf-8-sig'),
+                       file_name='my_interpretation.txt', mime='text/plain')
+    st.caption('입력 내용은 서버 파일이나 GitHub에 저장되지 않습니다. 브라우저 세션이 끝나면 사라질 수 있으니 다운로드하세요.')
+
+
+@st.cache_resource(show_spinner='추가 실험을 계산하는 중입니다…')
+def fit_extra(data):
+    required = ['추론 점수', '수학 점수']
+    for col in required:
+        if col not in data or not pd.to_numeric(data[col], errors='coerce').between(0, 100).all():
+            raise ValueError(f'{col}의 유효한 0~100 점수가 필요합니다.')
+    d = data.copy()
+    d[required] = d[required].apply(pd.to_numeric)
+    a, b = train_test_split(np.arange(len(d)), test_size=.2, random_state=SEED, stratify=d[TYPE])
+    train, test = d.iloc[a], d.iloc[b]
+    folds = list(StratifiedKFold(3, shuffle=True, random_state=SEED).split(train, train[TYPE]))
+    configurations = [('기본', []), ('추론 추가', ['추론 점수']), ('수학 추가', ['수학 점수']),
+                      ('추론+수학 추가', required)]
+    rows, predictions = [], {}
+    for family, name in [('선형 회귀', '선형 회귀 · 크기+유형'),
+                         ('랜덤 포레스트', '랜덤 포레스트 · 크기+유형')]:
+        for label, extras in configurations:
+            template = make_model(name, extras)
+            cols = [SIZE, TYPE] + extras
+            errors = []
+            for x, y in folds:
+                model = clone(template).fit(train.iloc[x][cols], train.iloc[x][TARGET])
+                errors.append(mean_absolute_error(train.iloc[y][TARGET], model.predict(train.iloc[y][cols])))
+            model = template.fit(train[cols], train[TARGET])
+            pred = model.predict(test[cols])
+            mae, r2 = metrics(test[TARGET], pred)
+            key = family + ' · ' + label
+            rows.append({'조합': key, '모델': family, '입력 조합': label,
+                         '교차검증 MAE': np.mean(errors), '테스트 MAE': mae, '테스트 R²': r2})
+            predictions[key] = pred
+    table = pd.DataFrame(rows)
+    selected = table.loc[table['교차검증 MAE'].idxmin(), '조합']
+    return {'table': table, 'selected': selected, 'predictions': predictions,
+            'test': test[['모델명', SIZE, TYPE, TARGET]].copy()}
+
+
+def extra_results_page(data, basic):
+    st.subheader('추가 실험: 추론·수학 점수가 예측을 보완할까?')
+    st.caption('모든 조합에 크기와 유형이 포함됩니다. 기본 실험과 같은 8:2 분할·시드 42, 같은 3겹 교차검증과 모델 설정을 사용합니다.')
+    st.caption('추론은 BBH 환산 점수, 수학은 MATH Level 5 점수입니다. 실제 활용 시 이 두 평가 점수를 미리 알아야 합니다.')
+    try:
+        result = fit_extra(data)
+    except Exception as e:
+        st.error(f'추가 실험을 수행하지 못했습니다: {e}')
+        return
+    table = result['table']
+    st.dataframe(table.drop(columns='조합').round(3), hide_index=True, width='stretch')
+    chart(px.bar(table, x='입력 조합', y='교차검증 MAE', color='모델', barmode='group',
+                 title='입력 조합별 교차검증 MAE · 작을수록 좋음'))
+    st.caption('후속 실험의 조합 선택은 학습 데이터 내부 교차검증 MAE를 사용합니다. 아래 테스트 수치는 기존 테스트를 재사용한 탐색 비교입니다.')
+    selected = result['selected']
+    st.write('교차검증 MAE가 가장 낮은 조합: ' + selected)
+    option = st.selectbox('예측 그래프에서 볼 조합', table['조합'].tolist(),
+                          index=table['조합'].tolist().index(selected), key='extra_model')
+    row = table.set_index('조합').loc[option]
+    base = table[(table['모델'] == row['모델']) & (table['입력 조합'] == '기본')].iloc[0]
+    c = st.columns(3)
+    c[0].metric('테스트 MAE', f"{row['테스트 MAE']:.2f}점")
+    c[1].metric('테스트 R²', f"{row['테스트 R²']:.3f}")
+    c[2].metric('같은 모델의 기본 입력 대비 MAE 감소', f"{base['테스트 MAE']-row['테스트 MAE']:+.2f}점")
+    points = result['test'].copy()
+    points['예측 점수'] = result['predictions'][option]
+    points['절대 오차'] = (points[TARGET] - points['예측 점수']).abs()
+    fig = px.scatter(points, x=TARGET, y='예측 점수', color=TYPE, hover_name='모델명',
+                     hover_data=[SIZE], color_discrete_map=COLORS, opacity=.6)
+    lo, hi = min(0, points['예측 점수'].min()), max(100, points['예측 점수'].max())
+    fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode='lines', name='정확한 예측선',
+                             line=dict(color='black', dash='dash')))
+    chart(fig)
+    st.caption('대각선에 가까울수록 정확합니다. 위쪽은 과대예측, 아래쪽은 과소예측입니다.')
+    with st.expander('유형별 오차·크게 틀린 사례'):
+        bytype = points.groupby(TYPE).agg(모델수=('절대 오차', 'size'), MAE=('절대 오차', 'mean'))
+        st.dataframe(bytype.round(3), width='stretch')
+        st.dataframe(points.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
+    st.download_button('추가 실험 비교표 다운로드', table.to_csv(index=False).encode('utf-8-sig'),
+                       file_name='extra_experiment.csv', mime='text/csv')
+    st.caption('해석은 ⑤ 해석·한계 화면에서 직접 작성하세요. 분석 범위는 네 유형·30.809B 이하이며 동일 계열 모델이 학습·테스트에 섞일 수 있습니다.')
 
 
 def main():
