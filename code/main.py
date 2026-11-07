@@ -218,9 +218,14 @@ def chart(fig):
 
 
 def question_page(data):
-    st.title('① 질문')
+    st.title('① 문제 정의')
+    st.subheader('주제 선정 이유')
+    st.write('AI 모델의 크기와 유형만 보고 실제 성능을 판단할 수 있는지 궁금해 이 주제를 선택했다. 공개된 평가 데이터를 활용해 사용자의 지시를 따르는 정도를 예측하고, 두 정보로 설명할 수 있는 부분과 한계를 확인하고자 했다.')
+    st.subheader('연구 질문')
     st.header('AI의 지시 수행 점수는 정말 모델 크기와 모델 유형만으로 예측할 수 있는가?')
-    st.write('대형 모델이 늘 좋은 점수를 얻는지, 모델의 제작·추가 학습 유형을 알면 예측이 얼마나 나아지는지 살펴봅니다. 평균만 사용하는 예측과 회귀 모델을 비교하여 두 정보가 설명하는 부분과 남는 오차를 확인합니다.')
+    st.subheader('분석 목적과 방법')
+    st.write('Open LLM Leaderboard의 네 유형에 속하는 공개 언어 모델 평가 기록을 대상으로, 모델 크기와 유형을 입력해 지시 수행 점수(IFEval)를 예측합니다. 예측 대상이 연속적인 수치이므로 회귀를 사용하며, 세 회귀 알고리즘을 학습 평균만 예측하는 기준선과 비교합니다.')
+    st.write('MAE·MSE·R²로 예측 성능과 남는 오차를 평가합니다. 이후 크기 상한을 없애 재학습한 결과를 같은 평가 데이터에서 비교하고, 별도의 추가 실험으로 추론·수학 점수가 예측을 보완하는지도 확인합니다.')
     st.info(f'기본 실험: 공개 언어 모델 네 유형 · 크기 0 초과 {CAP}B 이하 · {len(data):,}개. B는 10억 개 매개변수입니다. ⑤ 성능 개선에서는 정상적인 대형 모델도 포함해 크기 상한 없이 다시 학습합니다.')
     st.subheader('무엇을 입력하고 무엇을 예측하나?')
     st.dataframe(pd.DataFrame([
@@ -491,41 +496,40 @@ def improvement_page():
                        'size_range_predictions.csv', mime='text/csv')
 
 
-def interpretation_page(data, result):
+def interpretation_page():
     st.title('⑥ 해석·한계')
-    old = result['scores'].loc[result['selected']]
-    old_baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
-    st.write(f"기본 실험에서는 모델 크기와 유형을 입력한 세 회귀 알고리즘을 비교해 {result['selected'].split(' · ')[0]}를 선택했으며, 테스트 MAE는 {old['테스트 MAE']:.2f}점으로 평균 기준선의 {old_baseline:.2f}점보다 약 {100 * (1 - old['테스트 MAE'] / old_baseline):.1f}% 감소했지만 MSE는 {old['테스트 MSE']:.2f}점², R²는 {old['테스트 R²']:.3f}여서 정밀한 예측에는 한계가 있었다.")
     try:
-        expanded, _ = improvement_data()
-        comparison = fit_improvement(expanded)
-        additional = fit_extra(expanded)
+        data, _ = improvement_data()
+        comparison = fit_improvement(data)
+        additional = fit_extra(data)
     except Exception as e:
-        st.error(f'성능 개선 후 해석을 계산하지 못했습니다: {e}')
+        st.error(f'해석에 사용할 결과를 계산하지 못했습니다: {e}')
         return
-    current = comparison['expanded']
-    selected = current['scores'].loc[current['selected']]
-    baseline = current['scores'].loc['평균 기준선', '테스트 MAE']
-    overall = comparison['paired'].query('`평가 범위` == "전체"').set_index('학습 조건')
+    result = comparison['expanded']
+    selected = result['scores'].loc[result['selected']]
+    baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
+    overall = comparison['paired'][comparison['paired']['평가 범위'] == '전체'].set_index('학습 조건')
     small = comparison['paired'][comparison['paired']['평가 범위'] == f'{CAP}B 이하'].set_index('학습 조건')
     large = comparison['paired'][comparison['paired']['평가 범위'] == f'{CAP}B 초과'].set_index('학습 조건')
-    before, after = overall.loc['상한 유지 학습', 'MAE'], overall.loc['상한 없이 학습', 'MAE']
-    st.write(f"10차시에서는 정상적인 대형 모델을 제외할 필요가 있는지 검토해 {CAP}B 크기 상한을 없앴으며, 결측·비정상 값·유형 충돌·중복 처리는 유지한 채 대형 모델 {int(expanded[SIZE].gt(CAP).sum()):,}개를 복구해 총 {len(expanded):,}개로 다시 학습했다.")
-    st.write(f"같은 테스트 {int(overall.loc['상한 없이 학습', '평가 수']):,}개에서 상한 유지 학습과 상한 없는 학습을 비교하면 MAE는 {before:.2f}점에서 {after:.2f}점으로 약 {100 * (1 - after / before):.1f}% 감소했으므로, 전체 성능의 개선 폭은 작았다.")
-    st.write(f"같은 평가에서 MSE도 {overall.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {overall.loc['상한 없이 학습', 'MSE']:.2f}점²로 줄어, 평균 절대 오차뿐 아니라 큰 오차를 더 크게 반영한 지표에서도 개선을 확인했다.")
+    st.write(f"크기 상한 없는 {len(data):,}개 모델의 최종 분석에서 교차검증 MAE가 가장 낮은 {result['selected'].split(' · ')[0]}를 선택했으며, 테스트 MAE는 {selected['테스트 MAE']:.2f}점으로 평균 기준선 {baseline:.2f}점보다 약 {100 * (1 - selected['테스트 MAE'] / baseline):.1f}% 낮았다.")
+    st.write(f"최종 모델의 MSE는 {selected['테스트 MSE']:.2f}점², R²는 {selected['테스트 R²']:.3f}로, 모델 크기와 유형은 예측에 도움이 되지만 두 정보만으로 개별 점수를 정밀하게 예측하기에는 한계가 있었다.")
+    st.write(f"같은 테스트 {int(overall.loc['상한 없이 학습', '평가 수']):,}개에서 크기 상한을 없애면 MAE는 {overall.loc['상한 유지 학습', 'MAE']:.2f}→{overall.loc['상한 없이 학습', 'MAE']:.2f}점, MSE는 {overall.loc['상한 유지 학습', 'MSE']:.2f}→{overall.loc['상한 없이 학습', 'MSE']:.2f}점²로 감소했지만 전체 개선 폭은 작았다.")
     if not large.empty:
-        st.write(f"대형 모델 {int(large.loc['상한 없이 학습', '평가 수']):,}개의 MAE는 {large.loc['상한 유지 학습', 'MAE']:.2f}점에서 {large.loc['상한 없이 학습', 'MAE']:.2f}점으로, MSE는 {large.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {large.loc['상한 없이 학습', 'MSE']:.2f}점²로 줄어 대형 모델까지 예측하려는 목적에서는 이들의 학습 기록을 포함하는 편이 도움이 되었다.")
+        st.write(f"대형 모델 {int(large.loc['상한 없이 학습', '평가 수']):,}개의 MAE는 {large.loc['상한 유지 학습', 'MAE']:.2f}→{large.loc['상한 없이 학습', 'MAE']:.2f}점, MSE는 {large.loc['상한 유지 학습', 'MSE']:.2f}→{large.loc['상한 없이 학습', 'MSE']:.2f}점²로 줄어 대형 모델까지 예측하는 데 도움이 되었다.")
     if not small.empty:
-        st.write(f"{CAP}B 이하 모델의 MAE는 {small.loc['상한 유지 학습', 'MAE']:.2f}점에서 {small.loc['상한 없이 학습', 'MAE']:.2f}점으로 소폭 늘었고 MSE는 {small.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {small.loc['상한 없이 학습', 'MSE']:.2f}점²로 거의 같아, 모든 크기 구간에서 일관된 개선이 나타난 것은 아니었다.")
-    st.write(f"상한을 없앤 데이터에서 선택된 {current['selected'].split(' · ')[0]}의 MAE는 {selected['테스트 MAE']:.2f}점으로 평균 기준선 {baseline:.2f}점보다 약 {100 * (1 - selected['테스트 MAE'] / baseline):.1f}% 낮았지만 R²는 {selected['테스트 R²']:.3f}여서, 크기와 유형은 예측에 도움이 되더라도 두 정보만으로 정밀한 예측이 가능하다고 보기는 어렵다.")
+        st.write(f"{CAP}B 이하에서는 MAE가 {small.loc['상한 유지 학습', 'MAE']:.2f}→{small.loc['상한 없이 학습', 'MAE']:.2f}점으로 소폭 늘고 MSE는 거의 같아, 개선 효과는 크기 구간과 지표에 따라 달랐다.")
     row = additional['table'].set_index('조합').loc[additional['selected']]
-    st.write(f"확대 데이터의 추가 실험에서도 {row['모델']}의 {row['입력 조합']} 조합이 교차검증에서 선택되었으며, 테스트 MAE {row['테스트 MAE']:.2f}점·MSE {row['테스트 MSE']:.2f}점²·R² {row['테스트 R²']:.3f}를 보여 다른 평가 점수가 예측을 보완할 수 있음을 확인했다.")
-    counts = expanded[TYPE].value_counts().reindex(TYPES, fill_value=0)
-    distribution = ', '.join(f'{t} {int(counts[t]):,}개' for t in TYPES)
-    st.write(f'유형별 개수는 {distribution}로 불균형하며, 이번 개선에서는 개수 조정이나 학습 가중치를 적용하지 않아 전체 MAE가 기록이 많은 유형의 성능을 더 많이 반영한다는 한계가 있다.')
-    st.write('크기 상한을 없앴어도 네 유형의 공개 모델 평가 기록에 한정된 분석이며, 같은 계열이 학습·테스트에 함께 포함될 수 있고 학습 데이터·구조·평가 형식의 차이를 입력에 반영하지 않아 일반화에 한계가 있다.')
-    st.write('대형 모델의 테스트 기록은 적고 범위 수정과 추가 실험 모두 기존 결과를 확인한 뒤 진행한 후속 탐색이므로, 완전히 새로운 데이터나 계열별 분할에서 다시 검증할 필요가 있다.')
-    st.write('추론·수학 점수를 사용하는 예측은 해당 평가 결과를 미리 알아야 하며, 관찰된 예측 관계가 특정 학습 방식의 인과 효과나 AI의 전체 지능을 증명하지는 않는다.')
+    st.write(f"추가 실험의 {row['모델']}·{row['입력 조합']} 조합은 MAE {row['테스트 MAE']:.2f}점, MSE {row['테스트 MSE']:.2f}점², R² {row['테스트 R²']:.3f}를 보였지만, 이 예측에는 다른 평가 점수를 미리 알아야 한다.")
+    st.write('유형별 개수 불균형으로 전체 오차는 기록이 많은 유형의 영향을 더 받으며, 같은 계열이 학습·테스트에 섞일 수 있고 학습 데이터·구조·평가 형식의 차이를 입력에 반영하지 못했다.')
+    st.write('네 유형의 공개 모델에 한정되고 대형 모델의 평가 기록도 적으며, 범위 수정과 추가 실험은 기존 결과를 확인한 뒤 수행한 탐색이므로 새 데이터나 계열별 분할에서 재검증해야 한다.')
+
+
+def reflection_page():
+    st.title('⑦ 느낀점')
+    st.write('처음에는 결정계수가 낮으면 분석이 실패한 것이라고 생각했지만, 모델 크기와 유형만으로 점수를 충분히 설명하기 어렵다는 결과도 연구 질문에 대한 의미 있는 답이라는 것을 배웠다.')
+    st.write('크기가 큰 값을 무조건 제외하는 것이 좋은 전처리는 아니었으며, 정상적인 데이터를 유지할지 판단할 때는 연구 목적과 적용 범위를 함께 고려해야 한다는 것을 알게 되었다.')
+    st.write('MAE와 MSE의 변화 방향이 다를 수 있음을 직접 확인하면서, 하나의 지표가 낮아졌다는 이유만으로 모든 대상에서 성능이 좋아졌다고 판단하면 안 된다고 느꼈다.')
+    st.write('AI의 도움으로 코드를 작성하고 분석 방법을 이해했지만, 크기 제한의 적절성과 지표의 변화를 직접 검토하면서 AI의 설명도 데이터와 실제 결과를 근거로 확인해야 한다는 점을 배웠다.')
 
 
 @st.cache_resource(show_spinner='추가 실험을 계산하는 중입니다…')
@@ -620,7 +624,7 @@ def extra_results_page(data, basic, expanded=False):
 
 def main():
     st.set_page_config(page_title='AI의 지시 수행 점수 예측', page_icon='📊', layout='wide')
-    pages = ['① 질문', '② 데이터 보기', '③ 기준선', '④ 모델 결과', '⑤ 성능 개선', '⑥ 해석·한계']
+    pages = ['① 문제 정의', '② 데이터 보기', '③ 기준선', '④ 모델 결과', '⑤ 성능 개선', '⑥ 해석·한계', '⑦ 느낀점']
     with st.sidebar:
         st.title('AI 지시 수행 점수 예측')
         page = st.radio('발표 흐름', pages)
@@ -642,17 +646,20 @@ def main():
         data_page(data)
     elif page == pages[4]:
         improvement_page()
+    elif page == pages[5]:
+        interpretation_page()
+    elif page == pages[6]:
+        reflection_page()
     else:
         result = fit_experiment(data)
         if page == pages[2]:
             baseline_page(data, result)
         elif page == pages[3]:
             results_page(data, result)
-        else:
-            interpretation_page(data, result)
 
 
 if __name__ == '__main__':
     main()
+
 
 
