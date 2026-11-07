@@ -329,22 +329,14 @@ def robustness(data, selected, kind):
     return pd.DataFrame(rows, columns=['학습 조건', '테스트 범위', '학습 수', '테스트 수', 'MAE', 'R²'])
 
 
-def save_note(index):
-    st.session_state[f'note_draft_{index}'] = st.session_state[f'interpretation_{index}']
-
-
 def interpretation_page(data, result):
     st.title('⑤ 해석·한계')
-    st.caption('그래프와 수치를 확인한 뒤 직접 작성하세요. 입력한 글은 다운로드해 보관할 수 있습니다.')
-    fields = ['기본 실험 해석', '추가 실험 해석', '최종 결론', '한계와 더 해 보고 싶은 것']
-    notes = []
-    for i, label in enumerate(fields):
-        value = st.text_area(label, value=st.session_state.get(f'note_draft_{i}', ''), height=150,
-                             key=f'interpretation_{i}', on_change=save_note, args=(i,))
-        notes.append(label + '\n' + value)
-    st.download_button('내 해석 다운로드', '\n\n'.join(notes).encode('utf-8-sig'),
-                       file_name='my_interpretation.txt', mime='text/plain')
-    st.caption('입력 내용은 서버 파일이나 GitHub에 저장되지 않습니다. 브라우저 세션이 끝나면 사라질 수 있으니 다운로드하세요.')
+    st.write("기본 실험에서는 모델 크기와 유형을 입력해 선형 회귀·의사결정나무·랜덤 포레스트를 비교했으며, 학습 데이터 내부 교차검증에서 오차가 가장 낮은 랜덤 포레스트를 선택했다.")
+    st.write("이 모델의 테스트 MAE는 12.49점으로 학습 데이터의 평균 점수를 항상 예측하는 기준선의 16.82점보다 약 25.7% 감소했지만, R²는 0.366에 그쳐 두 정보만으로 개별 모델의 지시 수행 점수를 충분히 설명하기에는 한계가 있었다.")
+    st.write("따라서 모델 크기와 유형은 예측에 도움이 되지만, 이것만으로 정밀한 예측이 가능하다고 보기는 어렵다.")
+    st.write("또한 분석 대상을 네 유형의 30.809B 이하 공개 모델로 제한했으므로 대형 모델이나 다른 유형에 일반화하기 어렵고, 같은 계열의 모델이 학습·테스트에 함께 포함되어 성능이 낙관적으로 평가됐을 가능성도 있다.")
+    st.write("이를 보완하는 추가 실험에서는 추론·수학 점수를 함께 입력하자 MAE가 8.22점으로 감소했으며, 이번 데이터에서는 추론·수학 점수가 예측 오차를 줄이는 데 도움이 되었음을 보여준다.")
+    st.write("다만 이는 다른 평가 점수를 미리 알고 있을 때의 후속 탐색 결과이므로, 기본 실험의 결론을 바꾸기보다 두 입력만으로 설명하지 못했던 차이를 보완하는 근거로 해석했다.")
 
 
 @st.cache_resource(show_spinner='추가 실험을 계산하는 중입니다…')
@@ -424,7 +416,7 @@ def extra_results_page(data, basic):
         st.dataframe(points.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
     st.download_button('추가 실험 비교표 다운로드', table.to_csv(index=False).encode('utf-8-sig'),
                        file_name='extra_experiment.csv', mime='text/csv')
-    st.caption('해석은 ⑤ 해석·한계 화면에서 직접 작성하세요. 분석 범위는 네 유형·30.809B 이하이며 동일 계열 모델이 학습·테스트에 섞일 수 있습니다.')
+    st.caption('해석은 ⑤ 해석·한계 화면에서 확인할 수 있습니다. 분석 범위는 네 유형·30.809B 이하이며 동일 계열 모델이 학습·테스트에 섞일 수 있습니다.')
 
 
 def main():
