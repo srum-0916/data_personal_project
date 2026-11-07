@@ -62,6 +62,43 @@ def checked_data(raw):
     return d.reset_index(drop=True)
 
 
+@st.cache_data(ttl=3600, show_spinner='원본에서 크기 상한 없는 데이터를 준비하는 중입니다…')
+def improvement_data():
+    raw = load_data('open_llm_leaderboard.csv')
+    required = list(RENAMES)
+    missing = [c for c in required if c not in raw]
+    if missing:
+        raise ValueError('원본 CSV의 필수 열 없음: ' + ', '.join(missing))
+    d = raw[raw['Type'].isin(LABELS)].copy()
+    selected_count = len(d)
+    for col in ['#Params (B)', 'IFEval', 'BBH', 'MATH Lvl 5']:
+        d[col] = pd.to_numeric(d[col], errors='coerce')
+    valid = d['fullname'].notna() & np.isfinite(d['#Params (B)']) & d['#Params (B)'].gt(0)
+    for col in ['IFEval', 'BBH', 'MATH Lvl 5']:
+        valid &= np.isfinite(d[col]) & d[col].between(0, 100)
+    d = d[valid].copy()
+    valid_count = len(d)
+    conflicts = raw.groupby('fullname')['Type'].nunique().loc[lambda x: x > 1].index
+    d = d[~d['fullname'].isin(conflicts)].copy()
+    conflict_count = len(d)
+    d = d.drop_duplicates('fullname', keep='first').rename(columns=RENAMES)
+    d[TYPE] = d[TYPE].map(LABELS)
+    d['대화 형식 사용'] = d['대화 형식 사용'].map(
+        lambda value: '사용' if str(value).lower() in ['true', '1', '사용'] else
+        ('미사용' if str(value).lower() in ['false', '0', '미사용'] else np.nan))
+    cols = ['모델명', TYPE, SIZE, TARGET, '추론 점수', '수학 점수', '모델 구조', '수치 정밀도', '대화 형식 사용']
+    d = checked_data(d[cols])
+    audit = pd.DataFrame([
+        ['원본', 0, len(raw)],
+        ['네 유형 선택', len(raw) - selected_count, selected_count],
+        ['결측·비정상 크기·점수 점검', selected_count - valid_count, valid_count],
+        ['모델명별 유형 충돌 제외', valid_count - conflict_count, conflict_count],
+        ['반복 평가의 첫 기록 유지', conflict_count - len(d), len(d)],
+        ['크기 상한을 적용하지 않음', 0, len(d)],
+    ], columns=['단계', '제외 행', '남은 행'])
+    return d, audit
+
+
 def make_model(name, extras=()):
     if name == '평균 기준선':
         return DummyRegressor(strategy='mean')
@@ -119,6 +156,53 @@ def fit_experiment(data):
             'training_mean': train[TARGET].mean()}
 
 
+@st.cache_resource(show_spinner='같은 평가 데이터에서 크기 상한의 영향을 비교하는 중입니다…')
+def fit_improvement(data):
+    expanded = fit_experiment(data)
+    selected = expanded['selected']
+    train = data.iloc[expanded['train_idx']]
+    test = data.iloc[expanded['test_idx']]
+    folds = list(StratifiedKFold(3, shuffle=True, random_state=SEED).split(train, train[TYPE]))
+    capped_train = train[train[SIZE] <= CAP]
+    if len(capped_train) < 10:
+        raise ValueError('같은 조건의 크기 범위 비교를 위한 학습 기록이 부족합니다.')
+    errors = []
+    for a, b in folds:
+        fold_train = train.iloc[a]
+        fold_train = fold_train[fold_train[SIZE] <= CAP]
+        model = make_model(selected).fit(fold_train[[SIZE, TYPE]], fold_train[TARGET])
+        errors.append(mean_absolute_error(train.iloc[b][TARGET], model.predict(train.iloc[b][[SIZE, TYPE]])))
+    capped_model = make_model(selected).fit(capped_train[[SIZE, TYPE]], capped_train[TARGET])
+    before_pred = capped_model.predict(test[[SIZE, TYPE]])
+    after_pred = expanded['predictions'][selected]
+    paired_rows, conditions = [], []
+    for label, training, prediction, cv_mae in [
+        ('상한 유지 학습', capped_train, before_pred, float(np.mean(errors))),
+        ('상한 없이 학습', train, after_pred, expanded['scores'].loc[selected, '교차검증 MAE']),
+    ]:
+        mae, r2 = metrics(test[TARGET], prediction)
+        conditions.append([label, len(training), cv_mae, mae, r2])
+        for scope, mask in [
+            ('전체', np.ones(len(test), dtype=bool)),
+            (f'{CAP}B 이하', test[SIZE].le(CAP).to_numpy()),
+            (f'{CAP}B 초과', test[SIZE].gt(CAP).to_numpy()),
+        ]:
+            count = int(mask.sum())
+            if not count:
+                continue
+            actual = test[TARGET].to_numpy()[mask]
+            pred = prediction[mask]
+            paired_rows.append([label, scope, count, mean_absolute_error(actual, pred),
+                                r2_score(actual, pred) if count > 1 else np.nan])
+    predictions = test[['모델명', TYPE, SIZE, TARGET]].copy()
+    predictions['상한 유지 예측'] = before_pred
+    predictions['상한 없이 예측'] = after_pred
+    return {'expanded': expanded,
+            'conditions': pd.DataFrame(conditions, columns=['학습 조건', '학습 수', '교차검증 MAE', '테스트 MAE', '테스트 R²']),
+            'paired': pd.DataFrame(paired_rows, columns=['학습 조건', '평가 범위', '평가 수', 'MAE', 'R²']),
+            'predictions': predictions}
+
+
 def chart(fig):
     fig.update_layout(font=dict(family='sans-serif'), margin=dict(t=45, b=35), legend_title_text='')
     st.plotly_chart(fig, width='stretch')
@@ -128,14 +212,14 @@ def question_page(data):
     st.title('① 질문')
     st.header('AI의 지시 수행 점수는 정말 모델 크기와 모델 유형만으로 예측할 수 있는가?')
     st.write('대형 모델이 늘 좋은 점수를 얻는지, 모델의 제작·추가 학습 유형을 알면 예측이 얼마나 나아지는지 살펴봅니다. 평균만 사용하는 예측과 회귀 모델을 비교하여 두 정보가 설명하는 부분과 남는 오차를 확인합니다.')
-    st.info(f'분석 범위: 공개 언어 모델 네 유형 · 크기 0 초과 {CAP}B 이하 · 현재 {len(data):,}개. B는 10억 개 매개변수입니다.')
+    st.info(f'기본 실험: 공개 언어 모델 네 유형 · 크기 0 초과 {CAP}B 이하 · {len(data):,}개. B는 10억 개 매개변수입니다. ⑤ 성능 개선에서는 정상적인 대형 모델도 포함해 크기 상한 없이 다시 학습합니다.')
     st.subheader('무엇을 입력하고 무엇을 예측하나?')
     st.dataframe(pd.DataFrame([
         ['입력', SIZE, '수치형', '모델의 매개변수 수를 10억 단위로 표현'],
         ['입력', TYPE, '범주형', '사전학습·대화용·분야별 추가 학습·모델 병합'],
         ['예측 대상', TARGET, '수치형', 'IFEval 엄격 준수율 두 지표의 평균 × 100'],
     ], columns=['역할', '속성', '자료형', '뜻']), hide_index=True, width='stretch')
-    st.write('모델 유형에는 학습 방법과 병합 방법이 함께 포함되어 있어, 이를 하나의 학습량이나 학습 순서로 해석하지 않습니다. 추론·수학 점수, 모델명, 구조, 정밀도, 대화 형식은 이번 예측 입력에 넣지 않습니다.')
+    st.write('모델 유형에는 학습 방법과 병합 방법이 함께 포함되어 있어, 이를 하나의 학습량이나 학습 순서로 해석하지 않습니다. 기본 실험과 크기 상한 제거 실험의 입력은 크기·유형으로 같으며, 추론·수학 점수는 별도의 추가 실험에서만 사용합니다.')
     st.subheader('지시 수행 점수(IFEval)란?')
     st.write('AI가 사용자가 지정한 답변 조건을 얼마나 잘 지키는지 평가한 점수입니다. 문장 수, 특정 단어의 포함·금지, JSON 같은 출력 형식 등 프로그램으로 확인할 수 있는 조건을 검사합니다.')
     st.info('예시 요청: “환경 보호를 세 문장으로 설명하고, ‘재활용’을 포함하되 쉼표는 쓰지 마.”')
@@ -148,6 +232,8 @@ def question_page(data):
     st.subheader('추가 실험')
     st.write('기본 입력에 추론(BBH)·수학(MATH Level 5) 점수를 각각 또는 함께 추가해 예측 성능을 비교합니다.')
     st.caption('추가 실험은 다른 평가 점수를 이미 알고 있을 때의 예측입니다. 기존 테스트 결과를 확인한 뒤 수행한 후속 탐색이므로 완전히 독립적인 최종 검증은 아닙니다.')
+    st.subheader('성능 개선: 크기 상한 제거')
+    st.write('큰 모델도 정상적인 평가 기록이므로 크기가 크다는 이유만으로 제외하지 않습니다. 결측·비정상 값·유형 충돌·중복 처리와 네 유형 선택은 유지하고, 같은 평가 데이터에서 상한 유지 학습과 상한 없는 학습을 비교합니다.')
 
 
 def basic_stats(d, key):
@@ -192,7 +278,7 @@ def basic_stats(d, key):
 def data_page(data):
     st.title('② 데이터 보기')
     st.markdown('[출처: Hugging Face Open LLM Leaderboard contents](https://huggingface.co/datasets/open-llm-leaderboard/contents)')
-    section = st.radio('살펴볼 내용', ['전처리 데이터', '원본 기초통계', '전처리 근거', '주제별 그래프'], horizontal=True)
+    section = st.radio('살펴볼 내용', ['전처리 데이터', '원본 기초통계', '전처리 근거', '주제별 그래프', '성능 개선 데이터'], horizontal=True)
     if section == '원본 기초통계':
         try:
             basic_stats(load_data('open_llm_leaderboard.csv'), 'original')
@@ -211,8 +297,18 @@ def data_page(data):
         ], columns=['단계', '제외 행', '남은 행', '근거']), hide_index=True, width='stretch')
         st.write('크기의 Q1=6.061B, Q3=12.248B, IQR=6.187B입니다. 점수가 높거나 낮다는 이유만으로 삭제하지 않았으며, IFEval Raw는 IFEval을 100으로 나눈 중복 정보여서 제외했습니다.')
         st.warning('크기 울타리 밖에도 정상 모델이 있습니다. 이것은 오류 제거의 증명이 아닌 범위 제한입니다. 현재 전처리 CSV의 기록이므로 데이터가 바뀌면 전처리 근거도 다시 확인해야 합니다.')
+        st.write('10차시 성능 개선에서는 마지막 크기 범위 제한을 없앴습니다. 원본 CSV에서 동일한 정리 기준을 적용해 준비한 데이터와 전처리 과정을 ‘성능 개선 데이터’에서 확인할 수 있습니다.')
         if len(data) != 4121:
             st.warning('현재 CSV 행 수가 기록된 4,121행과 다릅니다. 전처리 기록을 갱신하세요.')
+    elif section == '성능 개선 데이터':
+        try:
+            expanded, audit = improvement_data()
+            st.write(f'원본에서 크기 상한 없이 준비한 {len(expanded):,}행·{len(expanded.columns)}열입니다. 기본 실험용 CSV를 덮어쓰지 않고 원본에서 계산합니다.')
+            st.dataframe(audit, hide_index=True, width='stretch')
+            basic_stats(expanded, 'expanded')
+            st.caption('유효한 큰 크기와 0점을 유지합니다. 핵심 입력·정답의 결측과 비정상 값은 제외하며, 예측에 쓰지 않는 모델 구조의 결측은 유지합니다.')
+        except Exception as e:
+            st.error(f'성능 개선 데이터를 준비하지 못했습니다: {e}')
     else:
         counts = data[TYPE].value_counts().reindex(TYPES, fill_value=0).rename_axis(TYPE).reset_index(name='모델 수')
         chart(px.bar(counts, x=TYPE, y='모델 수', color=TYPE, text='모델 수', color_discrete_map=COLORS))
@@ -231,6 +327,7 @@ def split_table(data, result):
 
 def baseline_page(data, result):
     st.title('③ 기준선')
+    st.caption(f'{CAP}B 이하 기본 실험의 기준선입니다. ⑤ 성능 개선에서는 확대된 학습 데이터의 평균으로 기준선을 다시 계산합니다.')
     st.write('아무 특징도 보지 않고 모든 모델에 학습 데이터의 평균 점수를 답하는 방법입니다. 크기·유형 정보가 도움이 되는지 판단할 출발점입니다.')
     st.write(f"전체 {len(data):,}개 → 학습 {len(result['train_idx']):,}개 / 테스트 {len(result['test_idx']):,}개. 유형 비율을 보존한 8:2 분할이며 난수 시드는 {SEED}입니다.")
     st.dataframe(split_table(data, result), width='stretch')
@@ -244,7 +341,7 @@ def baseline_page(data, result):
     chart(fig)
     st.write('MAE는 실제와 예측의 차이를 절댓값으로 계산한 평균이며 낮을수록 좋습니다. R²는 테스트 점수의 분산 대비 제곱오차를 평가하며 높을수록 좋고 음수도 가능합니다.')
     st.caption('테스트 R²의 0 기준은 테스트 평균 예측입니다. 학습 평균을 사용하는 우리 기준선의 테스트 R²는 정확히 0이 아닐 수 있습니다. 평가 데이터의 정답 평균을 예측값으로 사용하지 않습니다.')
-    st.warning('행 단위 분할이라 같은 기본 모델에서 파생된 다른 모델이 양쪽에 있을 수 있습니다. ⑤에서 제작자 단위 분할을 보조 점검하며, 이것도 완전한 계열 분리는 아닙니다.')
+    st.warning('행 단위 분할이라 같은 기본 모델에서 파생된 다른 모델이 양쪽에 있을 수 있습니다. 계열을 분리한 독립 평가는 수행하지 않아 성능이 낙관적일 수 있습니다.')
 
 
 def coefficient_table(result):
@@ -256,6 +353,7 @@ def coefficient_table(result):
 
 def results_page(data, result):
     st.title('④ 모델 결과')
+    st.caption(f'이 화면은 {CAP}B 이하의 기본 실험입니다. 상한을 없앤 재학습과 공통 테스트 비교는 ⑤ 성능 개선에서 확인할 수 있습니다.')
     experiment = st.radio('실험 선택', ['기본 실험', '추가 실험 · 추론·수학 점수'], horizontal=True)
     if experiment != '기본 실험':
         extra_results_page(data, result)
@@ -329,14 +427,85 @@ def robustness(data, selected, kind):
     return pd.DataFrame(rows, columns=['학습 조건', '테스트 범위', '학습 수', '테스트 수', 'MAE', 'R²'])
 
 
+def improvement_page():
+    st.title('⑤ 성능 개선')
+    st.write('개선 방법은 모델 크기의 상한을 없애는 것입니다. 네 유형 선택, 핵심 값의 결측·유효성 점검, 모델명별 유형 충돌 제외, 반복 평가의 첫 기록 유지는 그대로 적용합니다.')
+    try:
+        data, audit = improvement_data()
+        comparison = fit_improvement(data)
+    except Exception as e:
+        st.error(f'성능 개선 실험을 수행하지 못했습니다: {e}')
+        return
+    result = comparison['expanded']
+    restored = int(data[SIZE].gt(CAP).sum())
+    st.write(f'기본 범위 {len(data) - restored:,}개에 대형 모델 {restored:,}개를 복구해 {len(data):,}개를 사용합니다. 크기 범위는 {data[SIZE].min():g}~{data[SIZE].max():g}B이며 상한을 따로 적용하지 않습니다.')
+    experiment = st.radio('개선 실험에서 살펴볼 내용', ['크기 상한 제거 결과', '확대 데이터의 추가 실험'], horizontal=True, key='improvement_view')
+    if experiment == '확대 데이터의 추가 실험':
+        extra_results_page(data, result, expanded=True)
+        return
+    with st.expander('전처리 과정·유형별 개수'):
+        st.dataframe(audit, hide_index=True, width='stretch')
+        st.dataframe(data[TYPE].value_counts().reindex(TYPES).rename('모델 수'), width='stretch')
+        st.write('큰 크기나 높은·낮은 정상 점수는 그 자체로 오류가 아니므로 삭제하지 않습니다. 유형별 개수를 맞추거나 가중치를 주는 처리는 이번 개선에 추가하지 않았습니다.')
+    st.subheader('확대 데이터에서 세 모델 다시 비교')
+    st.write(f"학습 {len(result['train_idx']):,}개 / 테스트 {len(result['test_idx']):,}개, 시드 {SEED}, 유형 비율을 유지한 8:2 분할과 학습 내부 3겹 교차검증을 사용합니다. 입력은 크기·유형으로 동일하고 모델 설정도 유지합니다.")
+    st.write('학습 내부 교차검증으로 선택한 모델: ' + result['selected'])
+    st.dataframe(result['scores'].drop(index='선형 회귀 · 크기만').round(4), width='stretch')
+    selected = result['scores'].loc[result['selected']]
+    baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
+    c = st.columns(3)
+    c[0].metric('상한 없는 모델 · 테스트 MAE', f"{selected['테스트 MAE']:.2f}점")
+    c[1].metric('테스트 R²', f"{selected['테스트 R²']:.3f}")
+    c[2].metric('확대 범위 평균 기준선 대비 MAE 감소', f"{100 * (1 - selected['테스트 MAE'] / baseline):.1f}%")
+    st.subheader('같은 평가 데이터에서 상한 유지·제거 비교')
+    st.write('확대 데이터에서 학습·검증·테스트를 나눈 뒤, 상한 유지 조건에서만 학습 기록 중 큰 모델을 제외했습니다. 두 조건의 알고리즘·입력·설정·검증 폴드·테스트 대상은 같습니다. 학습 기록 수의 차이는 대형 모델 복구에 따른 변화입니다.')
+    st.dataframe(comparison['conditions'].round(4), hide_index=True, width='stretch')
+    paired = comparison['paired']
+    st.dataframe(paired.round(4), hide_index=True, width='stretch')
+    chart(px.bar(paired, x='평가 범위', y='MAE', color='학습 조건', barmode='group',
+                 text_auto='.2f', title='같은 테스트에서 크기 범위별 MAE · 낮을수록 좋음'))
+    st.caption('상한 유지 조건의 큰 모델 평가는 학습 범위 밖으로의 예측입니다. 학습에는 상한을 두더라도 대형 모델까지 예측하려는 경우의 한계를 확인하는 비교입니다.')
+    st.caption('④의 기본 실험과 이 화면의 확대 실험은 테스트 구성이 달라 직접적인 개선 비교에 사용할 수 없습니다. 위 공통 테스트에서의 비교를 사용하세요. 이번 실험은 기존 결과를 확인한 뒤 수행한 후속 탐색이며 새로운 독립 최종 검증은 아닙니다.')
+    st.download_button('공통 테스트 비교표 다운로드', paired.to_csv(index=False).encode('utf-8-sig'),
+                       'size_range_comparison.csv', mime='text/csv')
+    st.download_button('두 조건의 테스트 예측 다운로드', comparison['predictions'].to_csv(index=False).encode('utf-8-sig'),
+                       'size_range_predictions.csv', mime='text/csv')
+
+
 def interpretation_page(data, result):
-    st.title('⑤ 해석·한계')
-    st.write("기본 실험에서는 모델 크기와 유형을 입력해 선형 회귀·의사결정나무·랜덤 포레스트를 비교했으며, 학습 데이터 내부 교차검증에서 오차가 가장 낮은 랜덤 포레스트를 선택했다.")
-    st.write("이 모델의 테스트 MAE는 12.49점으로 학습 데이터의 평균 점수를 항상 예측하는 기준선의 16.82점보다 약 25.7% 감소했지만, R²는 0.366에 그쳐 두 정보만으로 개별 모델의 지시 수행 점수를 충분히 설명하기에는 한계가 있었다.")
-    st.write("따라서 모델 크기와 유형은 예측에 도움이 되지만, 이것만으로 정밀한 예측이 가능하다고 보기는 어렵다.")
-    st.write("또한 분석 대상을 네 유형의 30.809B 이하 공개 모델로 제한했으므로 대형 모델이나 다른 유형에 일반화하기 어렵고, 같은 계열의 모델이 학습·테스트에 함께 포함되어 성능이 낙관적으로 평가됐을 가능성도 있다.")
-    st.write("이를 보완하는 추가 실험에서는 추론·수학 점수를 함께 입력하자 MAE가 8.22점으로 감소했으며, 이번 데이터에서는 추론·수학 점수가 예측 오차를 줄이는 데 도움이 되었음을 보여준다.")
-    st.write("다만 이는 다른 평가 점수를 미리 알고 있을 때의 후속 탐색 결과이므로, 기본 실험의 결론을 바꾸기보다 두 입력만으로 설명하지 못했던 차이를 보완하는 근거로 해석했다.")
+    st.title('⑥ 해석·한계')
+    old = result['scores'].loc[result['selected']]
+    old_baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
+    st.write(f"기본 실험에서는 모델 크기와 유형을 입력한 세 회귀 알고리즘을 비교해 {result['selected'].split(' · ')[0]}를 선택했으며, 테스트 MAE는 {old['테스트 MAE']:.2f}점으로 평균 기준선의 {old_baseline:.2f}점보다 약 {100 * (1 - old['테스트 MAE'] / old_baseline):.1f}% 감소했지만 R²는 {old['테스트 R²']:.3f}에 그쳤다.")
+    try:
+        expanded, _ = improvement_data()
+        comparison = fit_improvement(expanded)
+        additional = fit_extra(expanded)
+    except Exception as e:
+        st.error(f'성능 개선 후 해석을 계산하지 못했습니다: {e}')
+        return
+    current = comparison['expanded']
+    selected = current['scores'].loc[current['selected']]
+    baseline = current['scores'].loc['평균 기준선', '테스트 MAE']
+    overall = comparison['paired'].query('`평가 범위` == "전체"').set_index('학습 조건')
+    small = comparison['paired'][comparison['paired']['평가 범위'] == f'{CAP}B 이하'].set_index('학습 조건')
+    large = comparison['paired'][comparison['paired']['평가 범위'] == f'{CAP}B 초과'].set_index('학습 조건')
+    before, after = overall.loc['상한 유지 학습', 'MAE'], overall.loc['상한 없이 학습', 'MAE']
+    st.write(f"10차시에서는 정상적인 대형 모델을 제외할 필요가 있는지 검토해 {CAP}B 크기 상한을 없앴으며, 결측·비정상 값·유형 충돌·중복 처리는 유지한 채 대형 모델 {int(expanded[SIZE].gt(CAP).sum()):,}개를 복구해 총 {len(expanded):,}개로 다시 학습했다.")
+    st.write(f"같은 테스트 {int(overall.loc['상한 없이 학습', '평가 수']):,}개에서 상한 유지 학습과 상한 없는 학습을 비교하면 MAE는 {before:.2f}점에서 {after:.2f}점으로 약 {100 * (1 - after / before):.1f}% 감소했으므로, 전체 성능의 개선 폭은 작았다.")
+    if not large.empty:
+        st.write(f"대형 모델 {int(large.loc['상한 없이 학습', '평가 수']):,}개의 MAE는 {large.loc['상한 유지 학습', 'MAE']:.2f}점에서 {large.loc['상한 없이 학습', 'MAE']:.2f}점으로 줄었으며, 대형 모델까지 예측하려는 목적에서는 이들의 학습 기록을 포함하는 편이 도움이 되었다.")
+    if not small.empty:
+        st.write(f"반면 {CAP}B 이하 모델의 MAE는 {small.loc['상한 유지 학습', 'MAE']:.2f}점에서 {small.loc['상한 없이 학습', 'MAE']:.2f}점으로 소폭 늘어 모든 크기 구간에서 성능이 좋아진 것은 아니었다.")
+    st.write(f"상한을 없앤 데이터에서 선택된 {current['selected'].split(' · ')[0]}의 MAE는 {selected['테스트 MAE']:.2f}점으로 평균 기준선 {baseline:.2f}점보다 약 {100 * (1 - selected['테스트 MAE'] / baseline):.1f}% 낮았지만 R²는 {selected['테스트 R²']:.3f}여서, 크기와 유형은 예측에 도움이 되더라도 두 정보만으로 정밀한 예측이 가능하다고 보기는 어렵다.")
+    row = additional['table'].set_index('조합').loc[additional['selected']]
+    st.write(f"확대 데이터의 추가 실험에서도 {row['모델']}의 {row['입력 조합']} 조합이 교차검증에서 선택되었으며, 테스트 MAE {row['테스트 MAE']:.2f}점과 R² {row['테스트 R²']:.3f}를 보여 다른 평가 점수가 예측을 보완할 수 있음을 확인했다.")
+    counts = expanded[TYPE].value_counts().reindex(TYPES, fill_value=0)
+    distribution = ', '.join(f'{t} {int(counts[t]):,}개' for t in TYPES)
+    st.write(f'유형별 개수는 {distribution}로 불균형하며, 이번 개선에서는 개수 조정이나 학습 가중치를 적용하지 않아 전체 MAE가 기록이 많은 유형의 성능을 더 많이 반영한다는 한계가 있다.')
+    st.write('크기 상한을 없앴어도 네 유형의 공개 모델 평가 기록에 한정된 분석이며, 같은 계열이 학습·테스트에 함께 포함될 수 있고 학습 데이터·구조·평가 형식의 차이를 입력에 반영하지 않아 일반화에 한계가 있다.')
+    st.write('대형 모델의 테스트 기록은 적고 범위 수정과 추가 실험 모두 기존 결과를 확인한 뒤 진행한 후속 탐색이므로, 완전히 새로운 데이터나 계열별 분할에서 다시 검증할 필요가 있다.')
+    st.write('추론·수학 점수를 사용하는 예측은 해당 평가 결과를 미리 알아야 하며, 관찰된 예측 관계가 특정 학습 방식의 인과 효과나 AI의 전체 지능을 증명하지는 않는다.')
 
 
 @st.cache_resource(show_spinner='추가 실험을 계산하는 중입니다…')
@@ -376,9 +545,10 @@ def fit_extra(data):
             'test': test[['모델명', SIZE, TYPE, TARGET]].copy()}
 
 
-def extra_results_page(data, basic):
+def extra_results_page(data, basic, expanded=False):
     st.subheader('추가 실험: 추론·수학 점수가 예측을 보완할까?')
-    st.caption('각 입력 조합에서 선형 회귀·의사결정나무·랜덤 포레스트 세 종류를 비교합니다. 모든 조합에 크기와 유형이 포함됩니다. 기본 실험과 같은 8:2 분할·시드 42, 같은 3겹 교차검증과 모델 설정을 사용합니다.')
+    scope = '크기 상한 없는 확대 데이터' if expanded else '30.809B 이하 기본 데이터'
+    st.caption(f'{scope}에서 각 입력 조합에 선형 회귀·의사결정나무·랜덤 포레스트를 비교합니다. 모든 조합에 크기와 유형이 포함됩니다. 해당 데이터의 크기+유형 실험과 같은 8:2 분할·시드 42, 같은 3겹 교차검증과 모델 설정을 사용합니다.')
     st.caption('추론은 BBH 환산 점수, 수학은 MATH Level 5 점수입니다. 실제 활용 시 이 두 평가 점수를 미리 알아야 합니다.')
     try:
         result = fit_extra(data)
@@ -393,7 +563,7 @@ def extra_results_page(data, basic):
     selected = result['selected']
     st.write('교차검증 MAE가 가장 낮은 조합: ' + selected)
     option = st.selectbox('예측 그래프에서 볼 조합', table['조합'].tolist(),
-                          index=table['조합'].tolist().index(selected), key='extra_model')
+                          index=table['조합'].tolist().index(selected), key='extra_model_expanded' if expanded else 'extra_model')
     row = table.set_index('조합').loc[option]
     base = table[(table['모델'] == row['모델']) & (table['입력 조합'] == '기본')].iloc[0]
     c = st.columns(3)
@@ -416,18 +586,18 @@ def extra_results_page(data, basic):
         st.dataframe(points.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
     st.download_button('추가 실험 비교표 다운로드', table.to_csv(index=False).encode('utf-8-sig'),
                        file_name='extra_experiment.csv', mime='text/csv')
-    st.caption('해석은 ⑤ 해석·한계 화면에서 확인할 수 있습니다. 분석 범위는 네 유형·30.809B 이하이며 동일 계열 모델이 학습·테스트에 섞일 수 있습니다.')
+    st.caption(f'해석은 ⑥ 해석·한계 화면에서 확인할 수 있습니다. 이 화면은 {scope}의 결과이며 동일 계열 모델이 학습·테스트에 섞일 수 있습니다.')
 
 
 def main():
     st.set_page_config(page_title='AI의 지시 수행 점수 예측', page_icon='📊', layout='wide')
-    pages = ['① 질문', '② 데이터 보기', '③ 기준선', '④ 모델 결과', '⑤ 해석·한계']
+    pages = ['① 질문', '② 데이터 보기', '③ 기준선', '④ 모델 결과', '⑤ 성능 개선', '⑥ 해석·한계']
     with st.sidebar:
         st.title('AI 지시 수행 점수 예측')
         page = st.radio('발표 흐름', pages)
         st.caption('모델 크기 + 모델 유형 → IFEval 점수')
         if st.button('데이터·학습 결과 새로고침'):
-            load_data.clear(); fit_experiment.clear(); robustness.clear()
+            load_data.clear(); improvement_data.clear(); fit_experiment.clear(); fit_improvement.clear(); fit_extra.clear(); robustness.clear()
         st.caption('고정 시드 42 · 학습 80% / 테스트 20% · 학습 안 3겹 교차검증')
     try:
         data = checked_data(load_data('llm_project_data_cleaned.csv'))
@@ -441,6 +611,8 @@ def main():
         question_page(data)
     elif page == pages[1]:
         data_page(data)
+    elif page == pages[4]:
+        improvement_page()
     else:
         result = fit_experiment(data)
         if page == pages[2]:
@@ -453,3 +625,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
