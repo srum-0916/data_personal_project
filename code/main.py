@@ -13,7 +13,7 @@ from sklearn.dummy import DummyRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split, StratifiedKFold, GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
@@ -134,16 +134,21 @@ def fit_experiment(data):
     rows, fitted, predictions = [], {}, {}
     for name in names:
         template = make_model(name)
-        fold_mae = []
+        fold_mae, fold_mse = [], []
         for a, b in cv:
             model = clone(template).fit(train.iloc[a][[SIZE, TYPE]], train.iloc[a][TARGET])
-            fold_mae.append(mean_absolute_error(train.iloc[b][TARGET], model.predict(train.iloc[b][[SIZE, TYPE]])))
+            fold_pred = model.predict(train.iloc[b][[SIZE, TYPE]])
+            fold_mae.append(mean_absolute_error(train.iloc[b][TARGET], fold_pred))
+            fold_mse.append(mean_squared_error(train.iloc[b][TARGET], fold_pred))
         model = template.fit(train[[SIZE, TYPE]], train[TARGET])
         pred = model.predict(test[[SIZE, TYPE]])
-        train_mae, _ = metrics(train[TARGET], model.predict(train[[SIZE, TYPE]]))
+        train_pred = model.predict(train[[SIZE, TYPE]])
+        train_mae, _ = metrics(train[TARGET], train_pred)
         mae, r2 = metrics(test[TARGET], pred)
-        rows.append({'모델': name, '학습 MAE': train_mae, '교차검증 MAE': np.mean(fold_mae),
-                     '교차검증 MAE 표준편차': np.std(fold_mae), '테스트 MAE': mae, '테스트 R²': r2})
+        rows.append({'모델': name, '학습 MAE': train_mae, '학습 MSE': mean_squared_error(train[TARGET], train_pred),
+                     '교차검증 MAE': np.mean(fold_mae), '교차검증 MSE': np.mean(fold_mse),
+                     '교차검증 MAE 표준편차': np.std(fold_mae), '테스트 MAE': mae,
+                     '테스트 MSE': mean_squared_error(test[TARGET], pred), '테스트 R²': r2})
         fitted[name], predictions[name] = model, pred
     scores = pd.DataFrame(rows).set_index('모델')
     selected = scores.drop(index=['평균 기준선', '선형 회귀 · 크기만'])['교차검증 MAE'].idxmin()
@@ -151,6 +156,7 @@ def fit_experiment(data):
     result['예측 점수'] = predictions[selected]
     result['잔차 (실제−예측)'] = result[TARGET] - result['예측 점수']
     result['절대 오차'] = result['잔차 (실제−예측)'].abs()
+    result['제곱 오차'] = result['잔차 (실제−예측)'].pow(2)
     return {'scores': scores, 'models': fitted, 'predictions': predictions, 'selected': selected,
             'train_idx': train_idx, 'test_idx': test_idx, 'test': result,
             'training_mean': train[TARGET].mean()}
@@ -166,22 +172,25 @@ def fit_improvement(data):
     capped_train = train[train[SIZE] <= CAP]
     if len(capped_train) < 10:
         raise ValueError('같은 조건의 크기 범위 비교를 위한 학습 기록이 부족합니다.')
-    errors = []
+    errors, squared_errors = [], []
     for a, b in folds:
         fold_train = train.iloc[a]
         fold_train = fold_train[fold_train[SIZE] <= CAP]
         model = make_model(selected).fit(fold_train[[SIZE, TYPE]], fold_train[TARGET])
-        errors.append(mean_absolute_error(train.iloc[b][TARGET], model.predict(train.iloc[b][[SIZE, TYPE]])))
+        fold_pred = model.predict(train.iloc[b][[SIZE, TYPE]])
+        errors.append(mean_absolute_error(train.iloc[b][TARGET], fold_pred))
+        squared_errors.append(mean_squared_error(train.iloc[b][TARGET], fold_pred))
     capped_model = make_model(selected).fit(capped_train[[SIZE, TYPE]], capped_train[TARGET])
     before_pred = capped_model.predict(test[[SIZE, TYPE]])
     after_pred = expanded['predictions'][selected]
     paired_rows, conditions = [], []
-    for label, training, prediction, cv_mae in [
-        ('상한 유지 학습', capped_train, before_pred, float(np.mean(errors))),
-        ('상한 없이 학습', train, after_pred, expanded['scores'].loc[selected, '교차검증 MAE']),
+    for label, training, prediction, cv_mae, cv_mse in [
+        ('상한 유지 학습', capped_train, before_pred, float(np.mean(errors)), float(np.mean(squared_errors))),
+        ('상한 없이 학습', train, after_pred, expanded['scores'].loc[selected, '교차검증 MAE'],
+         expanded['scores'].loc[selected, '교차검증 MSE']),
     ]:
         mae, r2 = metrics(test[TARGET], prediction)
-        conditions.append([label, len(training), cv_mae, mae, r2])
+        conditions.append([label, len(training), cv_mae, cv_mse, mae, mean_squared_error(test[TARGET], prediction), r2])
         for scope, mask in [
             ('전체', np.ones(len(test), dtype=bool)),
             (f'{CAP}B 이하', test[SIZE].le(CAP).to_numpy()),
@@ -192,14 +201,14 @@ def fit_improvement(data):
                 continue
             actual = test[TARGET].to_numpy()[mask]
             pred = prediction[mask]
-            paired_rows.append([label, scope, count, mean_absolute_error(actual, pred),
+            paired_rows.append([label, scope, count, mean_absolute_error(actual, pred), mean_squared_error(actual, pred),
                                 r2_score(actual, pred) if count > 1 else np.nan])
     predictions = test[['모델명', TYPE, SIZE, TARGET]].copy()
     predictions['상한 유지 예측'] = before_pred
     predictions['상한 없이 예측'] = after_pred
     return {'expanded': expanded,
-            'conditions': pd.DataFrame(conditions, columns=['학습 조건', '학습 수', '교차검증 MAE', '테스트 MAE', '테스트 R²']),
-            'paired': pd.DataFrame(paired_rows, columns=['학습 조건', '평가 범위', '평가 수', 'MAE', 'R²']),
+            'conditions': pd.DataFrame(conditions, columns=['학습 조건', '학습 수', '교차검증 MAE', '교차검증 MSE', '테스트 MAE', '테스트 MSE', '테스트 R²']),
+            'paired': pd.DataFrame(paired_rows, columns=['학습 조건', '평가 범위', '평가 수', 'MAE', 'MSE', 'R²']),
             'predictions': predictions}
 
 
@@ -332,14 +341,17 @@ def baseline_page(data, result):
     st.write(f"전체 {len(data):,}개 → 학습 {len(result['train_idx']):,}개 / 테스트 {len(result['test_idx']):,}개. 유형 비율을 보존한 8:2 분할이며 난수 시드는 {SEED}입니다.")
     st.dataframe(split_table(data, result), width='stretch')
     baseline = result['scores'].loc['평균 기준선']
-    c = st.columns(3)
+    c = st.columns(4)
     c[0].metric('학습 평균 = 모든 예측값', f"{result['training_mean']:.2f}점")
     c[1].metric('테스트 MAE', f"{baseline['테스트 MAE']:.2f}점")
-    c[2].metric('테스트 R²', f"{baseline['테스트 R²']:.3f}")
+    c[2].metric('테스트 MSE', f"{baseline['테스트 MSE']:.2f}점²")
+    c[3].metric('테스트 R²', f"{baseline['테스트 R²']:.3f}")
     fig = px.histogram(data.iloc[result['test_idx']], x=TARGET, nbins=30)
     fig.add_vline(x=result['training_mean'], line_dash='dash', annotation_text='학습 평균 기준선')
     chart(fig)
-    st.write('MAE는 실제와 예측의 차이를 절댓값으로 계산한 평균이며 낮을수록 좋습니다. R²는 테스트 점수의 분산 대비 제곱오차를 평가하며 높을수록 좋고 음수도 가능합니다.')
+    st.write('MAE는 실제와 예측의 차이를 절댓값으로 계산한 평균으로 단위는 점입니다. MSE는 차이를 제곱한 값의 평균으로 단위는 점²이며 큰 오차에 더 민감합니다. 두 지표 모두 낮을수록 좋습니다.')
+    st.latex(r'\mathrm{MSE}=\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2')
+    st.write('예를 들어 오차가 2점과 10점이면 MAE는 6점, MSE는 (4+100)/2=52점²입니다. MAE와 MSE는 단위가 달라 숫자의 크기를 서로 직접 비교하지 않습니다. R²는 점수의 변동 대비 제곱오차를 평가하며 높을수록 좋고 음수도 가능합니다.')
     st.caption('테스트 R²의 0 기준은 테스트 평균 예측입니다. 학습 평균을 사용하는 우리 기준선의 테스트 R²는 정확히 0이 아닐 수 있습니다. 평가 데이터의 정답 평균을 예측값으로 사용하지 않습니다.')
     st.warning('행 단위 분할이라 같은 기본 모델에서 파생된 다른 모델이 양쪽에 있을 수 있습니다. 계열을 분리한 독립 평가는 수행하지 않아 성능이 낙관적일 수 있습니다.')
 
@@ -367,12 +379,14 @@ def results_page(data, result):
     st.caption('세 알고리즘의 입력은 크기+유형으로 같습니다. 크기만 사용하는 선형 회귀는 입력 효과를 확인하는 보조 실험이며 별도 모델 종류로 세지 않습니다.')
     st.success('교차검증으로 선택한 모델: ' + result['selected'])
     st.dataframe(result['scores'].round(4), width='stretch')
-    st.caption('교차검증 표준편차는 3개 검증 폴드의 MAE 차이이며 신뢰구간이 아닙니다. 각 폴드 안에서 전처리 변환과 모델을 다시 학습합니다. 테스트 결과로 후보를 선택하지 않습니다.')
+    st.caption('교차검증 표준편차는 3개 검증 폴드의 MAE 차이이며 신뢰구간이 아닙니다. 각 폴드 안에서 전처리 변환과 모델을 다시 학습합니다. 선택 기준은 교차검증 MAE로 유지하며 MSE도 함께 평가합니다. 테스트 결과로 후보를 선택하지 않습니다.')
     with st.expander('모델 설정과 실제 분석 순서'):
         st.write('선형 회귀는 절편 포함 최소제곱법입니다. 유형은 사전학습을 기준으로 원핫 인코딩하며 크기는 B 단위 원값을 사용합니다. 의사결정나무는 최대 깊이 4, 잎 최소 표본 5, 시드 42입니다. 랜덤 포레스트는 150그루, 최대 깊이 8, 잎 최소 표본 5, 시드 42로 고정하고 추가 튜닝하지 않습니다.')
         st.write('CSV 읽기 → 핵심 열 유효성 점검 → 8:2 분할 → 학습 데이터 안 3겹 검증 → 후보 선택 → 전체 학습분으로 재학습 → 테스트 평가 → 오차 해석 순서입니다. 예측값을 0~100으로 잘라 성능을 개선하지 않습니다.')
-    bars = result['scores'][['학습 MAE', '교차검증 MAE', '테스트 MAE']].reset_index().melt(id_vars='모델', var_name='평가 구분', value_name='MAE (점)')
-    chart(px.bar(bars, x='모델', y='MAE (점)', color='평가 구분', barmode='group'))
+    error_metric = st.radio('비교 그래프의 오차 지표', ['MAE', 'MSE'], horizontal=True, key='basic_error_metric')
+    error_label = 'MAE (점)' if error_metric == 'MAE' else 'MSE (점²)'
+    bars = result['scores'][[f'학습 {error_metric}', f'교차검증 {error_metric}', f'테스트 {error_metric}']].reset_index().melt(id_vars='모델', var_name='평가 구분', value_name=error_label)
+    chart(px.bar(bars, x='모델', y=error_label, color='평가 구분', barmode='group'))
     name = st.selectbox('자세히 살펴볼 모델', list(result['scores'].index), index=list(result['scores'].index).index(result['selected']))
     points = data.iloc[result['test_idx']][['모델명', SIZE, TYPE, TARGET]].copy()
     points['예측 점수'] = result['predictions'][name]
@@ -453,17 +467,22 @@ def improvement_page():
     st.dataframe(result['scores'].drop(index='선형 회귀 · 크기만').round(4), width='stretch')
     selected = result['scores'].loc[result['selected']]
     baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
-    c = st.columns(3)
+    c = st.columns(4)
     c[0].metric('상한 없는 모델 · 테스트 MAE', f"{selected['테스트 MAE']:.2f}점")
-    c[1].metric('테스트 R²', f"{selected['테스트 R²']:.3f}")
-    c[2].metric('확대 범위 평균 기준선 대비 MAE 감소', f"{100 * (1 - selected['테스트 MAE'] / baseline):.1f}%")
+    c[1].metric('테스트 MSE', f"{selected['테스트 MSE']:.2f}점²")
+    c[2].metric('테스트 R²', f"{selected['테스트 R²']:.3f}")
+    c[3].metric('확대 범위 평균 기준선 대비 MAE 감소', f"{100 * (1 - selected['테스트 MAE'] / baseline):.1f}%")
     st.subheader('같은 평가 데이터에서 상한 유지·제거 비교')
     st.write('확대 데이터에서 학습·검증·테스트를 나눈 뒤, 상한 유지 조건에서만 학습 기록 중 큰 모델을 제외했습니다. 두 조건의 알고리즘·입력·설정·검증 폴드·테스트 대상은 같습니다. 학습 기록 수의 차이는 대형 모델 복구에 따른 변화입니다.')
     st.dataframe(comparison['conditions'].round(4), hide_index=True, width='stretch')
     paired = comparison['paired']
     st.dataframe(paired.round(4), hide_index=True, width='stretch')
-    chart(px.bar(paired, x='평가 범위', y='MAE', color='학습 조건', barmode='group',
-                 text_auto='.2f', title='같은 테스트에서 크기 범위별 MAE · 낮을수록 좋음'))
+    error_metric = st.radio('개선 전후 비교 지표', ['MAE', 'MSE'], horizontal=True, key='improvement_error_metric')
+    unit = '점' if error_metric == 'MAE' else '점²'
+    chart(px.bar(paired, x='평가 범위', y=error_metric, color='학습 조건', barmode='group',
+                 text_auto='.2f', labels={error_metric: f'{error_metric} ({unit})'},
+                 title=f'같은 테스트에서 크기 범위별 {error_metric} · 낮을수록 좋음'))
+    st.caption('MAE는 평균적인 오차 크기, MSE는 오차를 제곱한 평균으로 크게 틀린 예측의 영향을 더 크게 반영합니다. 단위는 각각 점·점²이며 후보 선택 기준은 교차검증 MAE로 유지합니다.')
     st.caption('상한 유지 조건의 큰 모델 평가는 학습 범위 밖으로의 예측입니다. 학습에는 상한을 두더라도 대형 모델까지 예측하려는 경우의 한계를 확인하는 비교입니다.')
     st.caption('④의 기본 실험과 이 화면의 확대 실험은 테스트 구성이 달라 직접적인 개선 비교에 사용할 수 없습니다. 위 공통 테스트에서의 비교를 사용하세요. 이번 실험은 기존 결과를 확인한 뒤 수행한 후속 탐색이며 새로운 독립 최종 검증은 아닙니다.')
     st.download_button('공통 테스트 비교표 다운로드', paired.to_csv(index=False).encode('utf-8-sig'),
@@ -476,7 +495,7 @@ def interpretation_page(data, result):
     st.title('⑥ 해석·한계')
     old = result['scores'].loc[result['selected']]
     old_baseline = result['scores'].loc['평균 기준선', '테스트 MAE']
-    st.write(f"기본 실험에서는 모델 크기와 유형을 입력한 세 회귀 알고리즘을 비교해 {result['selected'].split(' · ')[0]}를 선택했으며, 테스트 MAE는 {old['테스트 MAE']:.2f}점으로 평균 기준선의 {old_baseline:.2f}점보다 약 {100 * (1 - old['테스트 MAE'] / old_baseline):.1f}% 감소했지만 R²는 {old['테스트 R²']:.3f}에 그쳤다.")
+    st.write(f"기본 실험에서는 모델 크기와 유형을 입력한 세 회귀 알고리즘을 비교해 {result['selected'].split(' · ')[0]}를 선택했으며, 테스트 MAE는 {old['테스트 MAE']:.2f}점으로 평균 기준선의 {old_baseline:.2f}점보다 약 {100 * (1 - old['테스트 MAE'] / old_baseline):.1f}% 감소했지만 MSE는 {old['테스트 MSE']:.2f}점², R²는 {old['테스트 R²']:.3f}여서 정밀한 예측에는 한계가 있었다.")
     try:
         expanded, _ = improvement_data()
         comparison = fit_improvement(expanded)
@@ -493,13 +512,14 @@ def interpretation_page(data, result):
     before, after = overall.loc['상한 유지 학습', 'MAE'], overall.loc['상한 없이 학습', 'MAE']
     st.write(f"10차시에서는 정상적인 대형 모델을 제외할 필요가 있는지 검토해 {CAP}B 크기 상한을 없앴으며, 결측·비정상 값·유형 충돌·중복 처리는 유지한 채 대형 모델 {int(expanded[SIZE].gt(CAP).sum()):,}개를 복구해 총 {len(expanded):,}개로 다시 학습했다.")
     st.write(f"같은 테스트 {int(overall.loc['상한 없이 학습', '평가 수']):,}개에서 상한 유지 학습과 상한 없는 학습을 비교하면 MAE는 {before:.2f}점에서 {after:.2f}점으로 약 {100 * (1 - after / before):.1f}% 감소했으므로, 전체 성능의 개선 폭은 작았다.")
+    st.write(f"같은 평가에서 MSE도 {overall.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {overall.loc['상한 없이 학습', 'MSE']:.2f}점²로 줄어, 평균 절대 오차뿐 아니라 큰 오차를 더 크게 반영한 지표에서도 개선을 확인했다.")
     if not large.empty:
-        st.write(f"대형 모델 {int(large.loc['상한 없이 학습', '평가 수']):,}개의 MAE는 {large.loc['상한 유지 학습', 'MAE']:.2f}점에서 {large.loc['상한 없이 학습', 'MAE']:.2f}점으로 줄었으며, 대형 모델까지 예측하려는 목적에서는 이들의 학습 기록을 포함하는 편이 도움이 되었다.")
+        st.write(f"대형 모델 {int(large.loc['상한 없이 학습', '평가 수']):,}개의 MAE는 {large.loc['상한 유지 학습', 'MAE']:.2f}점에서 {large.loc['상한 없이 학습', 'MAE']:.2f}점으로, MSE는 {large.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {large.loc['상한 없이 학습', 'MSE']:.2f}점²로 줄어 대형 모델까지 예측하려는 목적에서는 이들의 학습 기록을 포함하는 편이 도움이 되었다.")
     if not small.empty:
-        st.write(f"반면 {CAP}B 이하 모델의 MAE는 {small.loc['상한 유지 학습', 'MAE']:.2f}점에서 {small.loc['상한 없이 학습', 'MAE']:.2f}점으로 소폭 늘어 모든 크기 구간에서 성능이 좋아진 것은 아니었다.")
+        st.write(f"{CAP}B 이하 모델의 MAE는 {small.loc['상한 유지 학습', 'MAE']:.2f}점에서 {small.loc['상한 없이 학습', 'MAE']:.2f}점으로 소폭 늘었고 MSE는 {small.loc['상한 유지 학습', 'MSE']:.2f}점²에서 {small.loc['상한 없이 학습', 'MSE']:.2f}점²로 거의 같아, 모든 크기 구간에서 일관된 개선이 나타난 것은 아니었다.")
     st.write(f"상한을 없앤 데이터에서 선택된 {current['selected'].split(' · ')[0]}의 MAE는 {selected['테스트 MAE']:.2f}점으로 평균 기준선 {baseline:.2f}점보다 약 {100 * (1 - selected['테스트 MAE'] / baseline):.1f}% 낮았지만 R²는 {selected['테스트 R²']:.3f}여서, 크기와 유형은 예측에 도움이 되더라도 두 정보만으로 정밀한 예측이 가능하다고 보기는 어렵다.")
     row = additional['table'].set_index('조합').loc[additional['selected']]
-    st.write(f"확대 데이터의 추가 실험에서도 {row['모델']}의 {row['입력 조합']} 조합이 교차검증에서 선택되었으며, 테스트 MAE {row['테스트 MAE']:.2f}점과 R² {row['테스트 R²']:.3f}를 보여 다른 평가 점수가 예측을 보완할 수 있음을 확인했다.")
+    st.write(f"확대 데이터의 추가 실험에서도 {row['모델']}의 {row['입력 조합']} 조합이 교차검증에서 선택되었으며, 테스트 MAE {row['테스트 MAE']:.2f}점·MSE {row['테스트 MSE']:.2f}점²·R² {row['테스트 R²']:.3f}를 보여 다른 평가 점수가 예측을 보완할 수 있음을 확인했다.")
     counts = expanded[TYPE].value_counts().reindex(TYPES, fill_value=0)
     distribution = ', '.join(f'{t} {int(counts[t]):,}개' for t in TYPES)
     st.write(f'유형별 개수는 {distribution}로 불균형하며, 이번 개선에서는 개수 조정이나 학습 가중치를 적용하지 않아 전체 MAE가 기록이 많은 유형의 성능을 더 많이 반영한다는 한계가 있다.')
@@ -528,16 +548,19 @@ def fit_extra(data):
         for label, extras in configurations:
             template = make_model(name, extras)
             cols = [SIZE, TYPE] + extras
-            errors = []
+            errors, squared_errors = [], []
             for x, y in folds:
                 model = clone(template).fit(train.iloc[x][cols], train.iloc[x][TARGET])
-                errors.append(mean_absolute_error(train.iloc[y][TARGET], model.predict(train.iloc[y][cols])))
+                fold_pred = model.predict(train.iloc[y][cols])
+                errors.append(mean_absolute_error(train.iloc[y][TARGET], fold_pred))
+                squared_errors.append(mean_squared_error(train.iloc[y][TARGET], fold_pred))
             model = template.fit(train[cols], train[TARGET])
             pred = model.predict(test[cols])
             mae, r2 = metrics(test[TARGET], pred)
             key = family + ' · ' + label
             rows.append({'조합': key, '모델': family, '입력 조합': label,
-                         '교차검증 MAE': np.mean(errors), '테스트 MAE': mae, '테스트 R²': r2})
+                         '교차검증 MAE': np.mean(errors), '교차검증 MSE': np.mean(squared_errors),
+                         '테스트 MAE': mae, '테스트 MSE': mean_squared_error(test[TARGET], pred), '테스트 R²': r2})
             predictions[key] = pred
     table = pd.DataFrame(rows)
     selected = table.loc[table['교차검증 MAE'].idxmin(), '조합']
@@ -557,8 +580,12 @@ def extra_results_page(data, basic, expanded=False):
         return
     table = result['table']
     st.dataframe(table.drop(columns='조합').round(3), hide_index=True, width='stretch')
-    chart(px.bar(table, x='입력 조합', y='교차검증 MAE', color='모델', barmode='group',
-                 title='입력 조합별 교차검증 MAE · 작을수록 좋음'))
+    metric_key = 'extra_error_metric_expanded' if expanded else 'extra_error_metric'
+    error_metric = st.radio('추가 실험 비교 지표', ['MAE', 'MSE'], horizontal=True, key=metric_key)
+    unit = '점' if error_metric == 'MAE' else '점²'
+    chart(px.bar(table, x='입력 조합', y=f'교차검증 {error_metric}', color='모델', barmode='group',
+                 labels={f'교차검증 {error_metric}': f'교차검증 {error_metric} ({unit})'},
+                 title=f'입력 조합별 교차검증 {error_metric} · 작을수록 좋음'))
     st.caption('후속 실험의 조합 선택은 학습 데이터 내부 교차검증 MAE를 사용합니다. 아래 테스트 수치는 기존 테스트를 재사용한 탐색 비교입니다.')
     selected = result['selected']
     st.write('교차검증 MAE가 가장 낮은 조합: ' + selected)
@@ -566,13 +593,15 @@ def extra_results_page(data, basic, expanded=False):
                           index=table['조합'].tolist().index(selected), key='extra_model_expanded' if expanded else 'extra_model')
     row = table.set_index('조합').loc[option]
     base = table[(table['모델'] == row['모델']) & (table['입력 조합'] == '기본')].iloc[0]
-    c = st.columns(3)
+    c = st.columns(4)
     c[0].metric('테스트 MAE', f"{row['테스트 MAE']:.2f}점")
-    c[1].metric('테스트 R²', f"{row['테스트 R²']:.3f}")
-    c[2].metric('같은 모델의 기본 입력 대비 MAE 감소', f"{base['테스트 MAE']-row['테스트 MAE']:+.2f}점")
+    c[1].metric('테스트 MSE', f"{row['테스트 MSE']:.2f}점²")
+    c[2].metric('테스트 R²', f"{row['테스트 R²']:.3f}")
+    c[3].metric('같은 모델의 기본 입력 대비 MAE 감소', f"{base['테스트 MAE']-row['테스트 MAE']:+.2f}점")
     points = result['test'].copy()
     points['예측 점수'] = result['predictions'][option]
     points['절대 오차'] = (points[TARGET] - points['예측 점수']).abs()
+    points['제곱 오차'] = (points[TARGET] - points['예측 점수']).pow(2)
     fig = px.scatter(points, x=TARGET, y='예측 점수', color=TYPE, hover_name='모델명',
                      hover_data=[SIZE], color_discrete_map=COLORS, opacity=.6)
     lo, hi = min(0, points['예측 점수'].min()), max(100, points['예측 점수'].max())
@@ -581,7 +610,7 @@ def extra_results_page(data, basic, expanded=False):
     chart(fig)
     st.caption('대각선에 가까울수록 정확합니다. 위쪽은 과대예측, 아래쪽은 과소예측입니다.')
     with st.expander('유형별 오차·크게 틀린 사례'):
-        bytype = points.groupby(TYPE).agg(모델수=('절대 오차', 'size'), MAE=('절대 오차', 'mean'))
+        bytype = points.groupby(TYPE).agg(모델수=('절대 오차', 'size'), MAE=('절대 오차', 'mean'), MSE=('제곱 오차', 'mean'))
         st.dataframe(bytype.round(3), width='stretch')
         st.dataframe(points.nlargest(10, '절대 오차').round(3), hide_index=True, width='stretch')
     st.download_button('추가 실험 비교표 다운로드', table.to_csv(index=False).encode('utf-8-sig'),
@@ -625,4 +654,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
